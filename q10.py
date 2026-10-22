@@ -362,6 +362,14 @@ DECISIVE_SIGNALS = [
         r"exact commercial duplicate to rejection",
         r"another scan of the same instrument",
         r"has already been paid",
+        # v3 fresh-audit family: prior payment for the SAME signed commercial
+        # invoice, OCR punctuation omitted ("A second payment would be a
+        # duplicate, so reject it")
+        r"prior payment for the SAME signed commercial invoice",
+        r"prior payment for the same commercial invoice",
+        r"the same signed commercial invoice\b",
+        r"the signed commercial invoice is identical",
+        r"second payment would be a duplicate",
     ]),
     ("open_exception", [
         r"exception workflow",
@@ -402,6 +410,14 @@ DECISIVE_SIGNALS = [
         r"reconcile without an exception",
         r"discrepancy remains",
         r"with no exception",
+        # v3 fresh-audit family: prior payment to the SAME supplier/amount but
+        # for a DIFFERENT signed commercial invoice — a different invoice is
+        # not a duplicate ("No payment was made for this exact invoice
+        # identity; it can be settled")
+        r"for a DIFFERENT signed commercial invoice",
+        r"for a different signed commercial invoice",
+        r"No payment was made for this exact invoice identity",
+        r"it can be settled",
     ]),
 ]
 

@@ -20,6 +20,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
 import urllib.request
 import urllib.error
 import logging
@@ -633,6 +634,22 @@ def deterministic_decision(dossier):
         plid = _rule_line(dossier, "create_draft")
         elid, _em = _find(mlines, re.compile(re.escape(ENQUIRY_CLAUSE)))
         evidence = [e for e in (plid, rlid, elid) if e]
+        # v3 fresh-audit trap family: a SIGNED approval deliberately does NOT
+        # cover this sender/status ("Approval EVT-... is authentic, but permits
+        # sending to <another>, not to the current sender"). The operative
+        # non-coverage line is part of the smallest sufficient evidence for the
+        # draft: it is the scoped fact that rules out send_approved_notice.
+        # Plain dossiers' empty-register lines ("the approval register contains
+        # a closed notice...") are NOT cited — green twin proposals prove the
+        # expected set there is just [policy, record, enquiry].
+        lm = {ln.get("lineId"): (ln.get("text") or "")
+              for src in (dossier.get("sources") or [])
+              for ln in (src.get("lines") or []) if isinstance(ln, dict)}
+        for lid, text in lm.items():
+            if text and re.search(r"Approval\s+EVT-[A-Z0-9]+\s+is\s+authentic,\s+but\s+permits", text):
+                if lid not in evidence:
+                    evidence.append(lid)
+                break
         return {"action": "create_draft", "evidence": evidence, "fields": fields}
 
     return None
