@@ -228,6 +228,11 @@ def init_db():
                     received REAL,
                     rec TEXT
                 );
+                CREATE TABLE IF NOT EXISTS q9_commit_wire (
+                    eval_id TEXT PRIMARY KEY,
+                    received REAL,
+                    rec TEXT
+                );
                 """
             )
     except Exception as e:
@@ -1094,6 +1099,24 @@ def put_wire(eval_id, rec):
     except Exception:
         logger.exception("q9 wire capture failed for %s", eval_id)
 
+def put_commit_wire(eval_id, rec):
+    """Persist the commit wire: the grader's pre-signed receipts AND the
+    executed/rejected outcomes. Together with put_wire's propose recording
+    this gives the complete truth table per evaluation, survival-proof
+    against any restart or RAM loss."""
+    try:
+        blob = canonical(rec)
+        with sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "INSERT OR REPLACE INTO q9_commit_wire VALUES (?,?,?)",
+                (eval_id, time.time(), blob))
+            conn.execute(
+                "DELETE FROM q9_commit_wire WHERE eval_id NOT IN "
+                "(SELECT eval_id FROM q9_commit_wire ORDER BY received DESC LIMIT 30)")
+    except Exception:
+        logger.exception("q9 commit-wire capture failed for %s", eval_id)
+
 def prune_wire(max_evals: int = 30):
     """Keep only the newest max_evals propose recordings."""
     try:
@@ -1155,6 +1178,7 @@ async def do_commit(body):
     }
     put_commit(commit_key, response)
     persist_receipt_bindings(eval_id, receipts)
+    put_commit_wire(eval_id, {"receipts": receipts, "outcomes": outcomes})
     return response
 
 @router.post("/v1/mailroom/actions")
@@ -1238,5 +1262,41 @@ async def debug_q9_wire(limit: int = 12, eval_id: str = "", full: int = 0):
             "decidedBy": rec.get("decidedBy", {}),
             "proposals": rec.get("proposals", []),
             "request": rec.get("request"),
+        })
+    return {"evals": out}
+
+@router.get("/debug/q9/commitwire")
+async def debug_q9_commit_wire(limit: int = 12, eval_id: str = "", full: int = 0):
+    """Restart-proof commit wire: the grader's pre-signed receipts and the
+    executed/rejected outcomes per proposal. This is the ground-truth table
+    for the offline auditor: a rejected outcome names exactly which fresh
+    proposal the grader refused, and the paired propose wire shows what we
+    proposed. Request bodies (if ever stored) only with ?full=1."""
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            if eval_id:
+                rows = conn.execute(
+                    "SELECT eval_id, received, rec FROM q9_commit_wire WHERE eval_id=?",
+                    (eval_id,)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT eval_id, received, rec FROM q9_commit_wire "
+                    "ORDER BY received DESC LIMIT ?", (max(1, min(limit, 40)),)).fetchall()
+    except Exception as e:
+        return {"error": "commit wire read failed: %s" % e}
+    out = []
+    for eid, received, blob in rows:
+        try:
+            rec = json.loads(blob)
+        except Exception:
+            rec = {}
+        if not eval_id and not full:
+            rec.pop("receipts", None)
+        out.append({
+            "evaluationId": eid,
+            "received": received,
+            "outcomes": rec.get("outcomes", []),
+            "receipts": rec.get("receipts"),
         })
     return {"evals": out}
