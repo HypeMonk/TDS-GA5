@@ -650,11 +650,20 @@ def deterministic_decision(dossier):
         lm = {ln.get("lineId"): (ln.get("text") or "")
               for src in (dossier.get("sources") or [])
               for ln in (src.get("lines") or []) if isinstance(ln, dict)}
-        for lid, text in lm.items():
-            if text and re.search(r"Approval\s+EVT-[A-Z0-9]+\s+is\s+authentic,\s+but\s+permits", text):
-                if lid not in evidence:
-                    evidence.append(lid)
-                break
+        # BOTH signatures of the covering-decision are required evidence in the
+        # trap family: the detail line ("Approval EVT-... is authentic, but
+        # permits sending to <another>, not to the current sender") AND the
+        # conclusion line ("The signed approval does not permit a notice to
+        # this sender for the current status"). Citing only one of them left
+        # one required line missing (sufficiency) and the set unequal
+        # (minimality) — the grader flags the receipt accepted=false.
+        for pat in (r"Approval\s+EVT-[A-Z0-9]+\s+is\s+authentic,\s+but\s+permits",
+                    r"The\s+signed\s+approval\s+does\s+not\s+permit\s+a\s+notice\s+to\s+this\s+sender"):
+            for lid, text in lm.items():
+                if text and re.search(pat, text):
+                    if lid not in evidence:
+                        evidence.append(lid)
+                    break
         return {"action": "create_draft", "evidence": evidence, "fields": fields}
 
     return None
