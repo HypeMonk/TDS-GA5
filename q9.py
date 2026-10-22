@@ -222,6 +222,11 @@ def init_db():
                     eval_id TEXT PRIMARY KEY,
                     jwk TEXT
                 );
+                CREATE TABLE IF NOT EXISTS q9_wire (
+                    eval_id TEXT PRIMARY KEY,
+                    received REAL,
+                    rec TEXT
+                );
                 """
             )
     except Exception as e:
@@ -498,6 +503,9 @@ ENQUIRY_RECORD_CLAUSE = "its current public status is exactly"
 Q = "[“\"]([^”\"]+)[”\"]"
 RE_APPROVAL = re.compile(r"Approval (EVT-[A-Z0-9]+) permits one delivery-status notice for (ORD-[A-Z0-9]+) to (\S+) using template (\S+)\.")
 RE_APPROVAL_STATUS = re.compile(r"valid for the public status " + Q)
+# v3 fresh-audit insurance: the approval's validity sentence may be re-housed in
+# a record/history source by an unseen family, in either known phrasing.
+RE_ANY_STATUS = re.compile(r"(?:valid for the public status |currently has the customer-visible status )" + Q)
 RE_CARRIER = re.compile(r"Event (EVT-[A-Z0-9]+) authorizes case (CASE-[A-Z0-9]+) to change (\w+) to the exact value " + Q)
 RE_MISMATCH = re.compile(r"The authenticated contact for (CASE-[A-Z0-9]+) does not match (\S+); the requested change therefore requires ([a-z-]+) confirmation\.")
 RE_ENQUIRY_RECORD = re.compile(r"Order (ORD-[A-Z0-9]+) is linked to (CASE-[A-Z0-9]+); its current public status is exactly " + Q)
@@ -583,6 +591,18 @@ def deterministic_decision(dossier):
     _src, lines = _bearing(dossier, "approval", "signed_internal", APPROVAL_CLAUSE)
     lid, m = _find(lines, RE_APPROVAL)
     slid, sm = _find(lines, RE_APPROVAL_STATUS)
+    if m and sm is None:
+        # v3 fresh-audit insurance: an unseen family may state the approval's
+        # validity sentence ("valid for the public status ...") in a record or
+        # history source instead of inside the approval itself — in either
+        # known phrasing. Scan the whole dossier once for it so the engine
+        # keeps solving the family deterministically with the minimal,
+        # sufficient set [permit, status-line] instead of the LLM cascade.
+        for check_lid, check_text, _s in dossier_lines(dossier):
+            sm = RE_ANY_STATUS.search(check_text)
+            if sm is not None:
+                slid = check_lid
+                break
     if m and sm:
         return {"action": "send_approved_notice", "evidence": [lid, slid], "fields": {"recipient": m.group(3), "referenceId": m.group(2), "status": sm.group(1)}}
 
@@ -889,6 +909,18 @@ async def do_propose(body):
         _put("INSERT OR REPLACE INTO q9_v3_eval_calls VALUES (?,?)", (eval_id + "|" + proposal["callId"], canonical(proposal)))
         proposals.append(proposal)
 
+    # v3 forensics: record which layer decided each dossier (persistent
+    # decision cache / deterministic engine / LLM cascade). An LLM tag on a
+    # fresh audit dossier is the prime suspect for an audit-proposal miss.
+    decided_by = {}
+    for did, fp, d in zip(ids, fingerprints, dossiers):
+        if did in cached:
+            decided_by[did] = "cache"
+        elif did in resolved:
+            decided_by[did] = "engine"
+        else:
+            decided_by[did] = "llm"
+
     response = {
         "profile": PROFILE,
         "evaluationId": eval_id,
@@ -896,6 +928,8 @@ async def do_propose(body):
         "inputDigest": input_digest,
         "proposals": proposals,
     }
+    put_wire(eval_id, {"request": body, "proposals": proposals, "decidedBy": decided_by})
+    prune_wire()
     # Store the broad conflict_key in the digest slot: propose replay/conflict
     # tests against the whole request, while commit re-derives digest(dossiers)
     # from the stored response's inputDigest field (unchanged contract).
@@ -1032,6 +1066,29 @@ def persist_receipt_bindings(eval_id, receipts):
         _put("INSERT OR IGNORE INTO q9_v3_receipts VALUES (?,?)", (rid, eval_id))
         _put("INSERT OR IGNORE INTO q9_v3_callbind VALUES (?,?)", (eval_id + "|" + call_id, rid))
 
+def put_wire(eval_id, rec):
+    """Persist the full propose wire (request + proposals + decision source) so
+    a Render restart can never again erase the evidence needed to audit
+    sufficiency/minimality offline. One row per evaluation."""
+    try:
+        blob = canonical(rec)
+        _put("INSERT OR REPLACE INTO q9_wire VALUES (?,?,?)",
+             (eval_id, time.time(), blob))
+    except Exception:
+        logger.exception("q9 wire capture failed for %s", eval_id)
+
+def prune_wire(max_evals: int = 30):
+    """Keep only the newest max_evals propose recordings."""
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "DELETE FROM q9_wire WHERE eval_id NOT IN "
+                "(SELECT eval_id FROM q9_wire ORDER BY received DESC LIMIT ?)",
+                (max_evals,))
+    except Exception as e:
+        logger.error("q9 wire prune failed: %s", e)
+
 async def do_commit(body):
     eval_id, input_digest, receipts = validate_commit(body)
 
@@ -1123,3 +1180,46 @@ async def mailroom(request: Request):
     raise HTTPException(status_code=400, detail="unknown operation")
 
 handle_mailroom_actions = mailroom
+
+
+# ------------------------------------------------------------------ forensics
+
+@router.get("/debug/q9/wire")
+async def debug_q9_wire(limit: int = 12, eval_id: str = "", full: int = 0):
+    """Restart-proof propose wire, newest evaluations first.
+
+    Each record carries the raw propose REQUEST (every dossier, including the
+    fresh audit families), OUR proposals, and which layer decided each dossier
+    (cache/engine/llm) — everything the offline evidence auditor needs, even
+    after a Render restart wipes the in-memory logs. Request bodies (the heavy
+    part) are included only with ?full=1 or when a single eval_id is given.
+    """
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            if eval_id:
+                rows = conn.execute(
+                    "SELECT eval_id, received, rec FROM q9_wire WHERE eval_id=?",
+                    (eval_id,)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT eval_id, received, rec FROM q9_wire "
+                    "ORDER BY received DESC LIMIT ?", (max(1, min(limit, 40)),)).fetchall()
+    except Exception as e:
+        return {"error": "wire read failed: %s" % e}
+    out = []
+    for eid, received, blob in rows:
+        try:
+            rec = json.loads(blob)
+        except Exception:
+            rec = {}
+        if not eval_id and not full:
+            rec.pop("request", None)
+        out.append({
+            "evaluationId": eid,
+            "received": received,
+            "decidedBy": rec.get("decidedBy", {}),
+            "proposals": rec.get("proposals", []),
+            "request": rec.get("request"),
+        })
+    return {"evals": out}

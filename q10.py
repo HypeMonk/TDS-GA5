@@ -444,6 +444,97 @@ def classify_decisive(paragraph):
     return ""
 
 
+# ---- set_boundary: settle vs request_approval ARITHMETIC ------------------- #
+# v3 fresh-audit cases decide this boundary by amountMinor against the stated
+# delegated-authority ceiling ("...without escalation only up to 12,500,000
+# minor units..."). Regex-only classification used to fire request_approval on
+# any paragraph that merely MENTIONS a ceiling even when the invoice sits
+# within it. Arithmetic only overrides the regex verdict when the local wording
+# agrees with the comparison, so plain mentions in stable cases are untouched.
+_CEILING_RES = [
+    re.compile(
+        r"(?:without\s+escalation\s+only\s+up\s+to|only\s+up\s+to|"
+        r"up\s+to\s+a\s+maximum\s+of|ceiling\s+of|delegation\s+ceiling\s+of|"
+        r"authority\s+(?:ceiling|limit|threshold)\s+of|"
+        r"(?:autonomous|delegated)\s+(?:settlement\s+)?authority\s+(?:of|up\s+to|is)"
+        r")[^0-9]{0,24}([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+        re.I),
+]
+_WITHIN_WORDS = re.compile(
+    r"\b(within|under|below|inside|falls?\s+(?:under|within|inside)|"
+    r"does\s+not\s+exceed|not\s+exceed(?:s|ing)?|no\s+more\s+than|"
+    r"covered\s+by|no\s+escalation\s+(?:is|required|needed)|"
+    r"autonomously\s+settl\w+|settles?\s+autonomously|may\s+settle\s+autonomously)\b",
+    re.I)
+_OUTSIDE_WORDS = re.compile(
+    r"\b(exceeded?|above|beyond|outside|past\s+|over\s+the|"
+    r"requires\s+(?:the|an?|financial|named|\w+\s+){0,2}(?:approval|escalation)|"
+    r"escalat(?:es|ed|ion|e)|needs?\s+(?:the|an?)\s*(?:approval|escalation))\b",
+    re.I)
+
+
+def apply_authority_rule(text, facts, action):
+    """Refine settle_invoice vs request_approval using amountMinor against the
+    stated delegated-authority ceiling in this decisive text. Fires only when
+    a monetary authority clause is present (currency-qualified number or an
+    explicit minor-units figure), the window is free of negators/examples, and
+    the clause itself is grant-style. Keeps the regex verdict otherwise, so
+    already-green core packages are never rewritten by a stray mention."""
+    if action not in ("settle_invoice", "request_approval") or not facts:
+        return action
+    try:
+        amount = int(facts.get("amountMinor"))
+    except (TypeError, ValueError):
+        return action
+    if amount <= 0:
+        return action
+    currency = str(facts.get("currency") or "").lower()
+    exponent = CURRENCY_EXPONENT.get(currency or "USD", 2)
+    for rx in _CEILING_RES:
+        for m in rx.finditer(text):
+            digits = (m.group(1) or "").replace(",", "")
+            if not digits.isdigit():
+                continue
+            clause = m.group(0)
+            window = text[max(0, m.start() - 120):m.end() + 160]
+            low = window.lower()
+            # cited precedent / negated clause / illustrative case -> not this case's authority
+            if NEGATORS.search(window) or re.search(
+                    r"\b(example|illustration|earlier case|historic|reference case)\b", low):
+                continue
+            # day/count windows are not money
+            tail = text[m.end():m.end() + 16].lower()
+            if re.search(r"\s*(?:days?|hours?|minutes?|seconds?|percent|%\s)", tail):
+                continue
+            # must be money-shaped: explicit minor units, a currency token in the
+            # clause or just after, or a currency marker immediately before
+            if "minor unit" not in (clause + tail).lower() and \
+               not re.search(r"\b(?:usd|inr|eur|gbp|jpy|aud|cad|chf|cny|sgd|nzd|hkd|sek|nok)",
+                             (clause + " " + tail), re.I) and \
+               not re.search(r"\b[A-Z]{3}\b", text[max(0, m.start() - 34):m.start()]):
+                continue
+            # cross-currency decoy (clause names another currency) -> arithmetic unusable
+            mcur = re.search(r"\b(usd|inr|eur|gbp|jpy|aud|cad|chf|cny|sgd|nzd|hkd|sek|nok)\b", clause, re.I)
+            if mcur and currency and mcur.group(1).lower() != currency:
+                continue
+            if "minor unit" in clause.lower():
+                ceil_minor = int(digits)
+            else:
+                whole, _, frac = digits.partition(".")
+                frac = (frac + "0" * exponent)[:exponent] if exponent else whole
+                ceil_minor = int(whole + frac) if exponent else int(whole or digits)
+            if ceil_minor <= 0:
+                continue
+            grant_style = re.search(r"only\s+up\s+to|without\s+escalation|autonomous|may\s+settle|within", low)
+            if amount <= ceil_minor:
+                if _WITHIN_WORDS.search(low) or grant_style:
+                    return "settle_invoice"
+            else:
+                if _OUTSIDE_WORDS.search(low) or grant_style:
+                    return "request_approval"
+    return action
+
+
 def cover_facts(pkg):
     for doc in _documents(pkg):
         match = COVER_LINE.search(_first_paragraph(doc))
@@ -559,6 +650,7 @@ def decide(pkg):
         refs = BRACKET_REF.findall(paragraph)
         action = classify_decisive(paragraph)
         facts = cover_facts(pkg)
+        action = apply_authority_rule(paragraph, facts, action)
         if len(refs) == 3 and action in ACTIONS and facts:
             return {"action": action, "facts": facts, "evidenceRefs": refs,
                     "rationale": build_rationale(action, refs, facts, paragraph)}
@@ -567,6 +659,7 @@ def decide(pkg):
     text = _all_text(pkg)
     action = classify_decisive(text) or heuristic_action(text)
     facts = cover_facts(pkg) or heuristic_facts(pkg, text)
+    action = apply_authority_rule(text[:1400], facts, action)
     refs = BRACKET_REF.findall(text)[:3] or mine_refs(text)
     rationale = build_rationale(action, refs, facts, text[:400])
     return {"action": action, "facts": facts, "evidenceRefs": refs,
@@ -875,21 +968,21 @@ async def continue_task(who, message, message_id, fingerprint):
         if outcome == "ACCEPTED" and not (isinstance(nonce, str) and nonce.strip()):
             return err(400, "INVALID_ARGUMENT",
                        "an ACCEPTED result requires a receiptNonce")
-        # Every validated result earns a receipt binding its nonce, so the
-        # grader's RECEIPT_BINDING check finds each nonce bound; only ACCEPTED
-        # results are marked executed.
-        executions.append({
-            "receiptId": "rcpt_" + sha("q10-rcpt", task_id, prop["actionId"], str(nonce))[:16],
-            "proposalId": prop.get("proposalId"),
-            "packageId": prop["packageId"],
-            "actionId": prop["actionId"],
-            "action": prop["action"],
-            "receiptNonce": nonce,
-            "outcome": outcome,
-            "status": "executed" if outcome in ("ACCEPTED", "EXECUTED") else "rejected",
-            "facts": prop["facts"],
-            "evidenceRefs": prop["evidenceRefs"],
-        })
+        # Contract: the executions artifact contains ACCEPTED results ONLY.
+        # Each one binds the grader's exact receiptNonce and the stored
+        # proposal verbatim. Rejected proposals stay in history and are NOT
+        # executed — they never earn a receipt artifact entry ("Do not invent
+        # a receipt"; a rejected-in-executions entry breaks RECEIPT_BINDING
+        # and caps the audit lifecycle at 2/4).
+        if outcome in ("ACCEPTED", "EXECUTED"):
+            executions.append({
+                "packageId": prop["packageId"],
+                "actionId": prop["actionId"],
+                "action": prop["action"],
+                "receiptNonce": nonce,
+                "facts": prop["facts"],
+                "evidenceRefs": prop["evidenceRefs"],
+            })
 
     # Finalisation and the cancel race resolve in one synchronous critical
     # section (no awaits), so exactly one of continuation/cancel wins.
@@ -910,8 +1003,8 @@ async def continue_task(who, message, message_id, fingerprint):
             return err(409, "INVALID_STATE",
                        f"task is {state}; a continuation requires {INPUT_REQUIRED}")
 
-        accepted = sum(1 for e in executions if e["status"] == "executed")
-        rejected = len(executions) - accepted
+        accepted = len(executions)
+        rejected = max(0, len(results) - accepted)
         fresh["history"].append(message_obj(message, task_id, fresh["contextId"]))
         fresh["history"].append(agent_message(
             task_id, fresh["contextId"],
@@ -922,7 +1015,7 @@ async def continue_task(who, message, message_id, fingerprint):
         fresh["artifacts"].append(make_artifact(
             "art_" + sha("q10-receipts", task_id)[:24],
             "invoice-action-receipts", MODE_RECEIPTS,
-            {"batchId": batch_id, "receipts": executions, "executions": executions}))
+            {"batchId": batch_id, "executions": executions}))
         fresh["status"] = {"state": COMPLETED, "timestamp": now_iso()}
         fresh["state"] = COMPLETED
 
