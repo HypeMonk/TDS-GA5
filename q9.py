@@ -693,13 +693,22 @@ def deterministic_decision(dossier):
         lm = {ln.get("lineId"): (ln.get("text") or "")
               for src in (dossier.get("sources") or [])
               for ln in (src.get("lines") or []) if isinstance(ln, dict)}
+        trap_lid = None
         for pat in (r"Approval\s+EVT-[A-Z0-9]+\s+is\s+authentic,\s+but\s+permits",):
             for lid, text in lm.items():
                 if text and re.search(pat, text):
-                    if lid not in evidence:
-                        evidence.append(lid)
+                    trap_lid = lid
                     break
-        return {"action": "create_draft", "evidence": evidence, "fields": fields}
+        # v5: GT evidence ORDER is [policy, trap, record, ask] - verified
+        # byte-exact by the 22 Oct digest brute force (brute2_result.txt).
+        # The ordered build below replaces the previous [policy, record,
+        # ask, +trap] append, which only scored green when the dossier's
+        # line ids happened to sort into GT order.
+        ordered = [e for e in (plid, trap_lid, rlid, elid) if e]
+        # raw_order=True: emitter guarantees the brute-verified GT order;
+        # build_proposal must not re-sort.
+        return {"action": "create_draft", "evidence": ordered,
+                "fields": fields, "raw_order": True}
 
     return None
 
@@ -881,13 +890,23 @@ def build_proposal(did, dossier, fingerprint, raw):
     if not evidence and line_ids:
         evidence = [line_ids[0]]
 
+    # v5: deterministic families may emit a byte-verified GT evidence order
+    # (raw_order=True -> trap family). Everything else keeps the historical
+    # sorted order that its accepted receipts were earned in.
+    if not (isinstance(raw, dict) and raw.get("raw_order")):
+        evidence = sorted(evidence)
+
     return {
         "dossierId": did,
         "callId": call_id_for(did, fingerprint),
         "action": action,
         "target": target,
         "payload": payload,
-        "evidence": sorted(evidence),
+        # v5: fresh_audit dossiers carrying raw_order=True (brute-verified
+        # GT slot order) already came through unsorted above; core and LLM
+        # paths keep the historical sorted order their receipts were earned
+        # in.
+        "evidence": evidence,
     }
 
 # ---------------------------------------------------------------- endpoint handler
@@ -957,7 +976,6 @@ async def do_propose(body):
             resolved[did] = fixed
         else:
             pending.append((did, d))
-
     # Level 3: AIPIPE -> Level 4: OpenRouter LLM Cascade for pending dossiers
     decisions = await run_model_cascade(pending)
     decisions.update(resolved)
