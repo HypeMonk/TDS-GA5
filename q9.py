@@ -625,7 +625,8 @@ def deterministic_decision(dossier):
         return {"action": "no_action", "evidence": ev, "fields": {"reasonCode": COMPLETED_REASONS[m.group(2)], "referenceId": ref_id}}
 
     _src, lines = _bearing(dossier, "approval", "signed_internal", APPROVAL_CLAUSE,
-                           "authorizes a single outbound shipment update")
+                           "authorizes a single outbound shipment update",
+                           "grants one customer-status message concerning")
     lid, m = _find(lines, RE_APPROVAL)
     slid, sm = _find(lines, RE_APPROVAL_STATUS)
     if m and sm is None:
