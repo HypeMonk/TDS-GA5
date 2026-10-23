@@ -759,7 +759,10 @@ def deterministic_decision(dossier):
                     for ln in (src.get("lines") or []) if isinstance(ln, dict)}
             _tlid = None
             for _til, _txt in _lmx.items():
-                if _txt and re.search(r"Approval\s+EVT-[A-Z0-9]+\s+is\s+authentic,\s+but\s+permits", _txt):
+                if _txt and re.search(
+                        r"Approval\s+EVT-[A-Z0-9]+\s+is\s+authentic,\s+but\s+permits"
+                        r"|A signed authorization applies to another customer",
+                        _txt):
                     _tlid = _til
                     break
             evx = [e for e in (dplid, _tlid, mlid, rlid) if e]
@@ -797,8 +800,7 @@ def deterministic_decision(dossier):
             for lid, text in lm.items():
                 if text and re.search(pat, text):
                     trap_lid = lid
-                    break
-        # v5: GT evidence ORDER is [policy, trap, record, ask] - verified
+                    break        # v5: GT evidence ORDER is [policy, trap, record, ask] - verified
         # byte-exact by the 22 Oct digest brute force (brute2_result.txt).
         # The ordered build below replaces the previous [policy, record,
         # ask, +trap] append, which only scored green when the dossier's
@@ -806,10 +808,23 @@ def deterministic_decision(dossier):
         # v8: the trap detail line belongs to the clause-3-clone family only.
         # For clause-1/2 authorities the trap is a decoy and GT is the plain
         # [policy, record, ask] set.
+        # v11 correction from d_r2muVMc85YN8JSFQY6: compose+prep rows cite
+        # trapA for the c2 clone too (c3 twin UvKUSH proved the shape). The
+        # real invariant: compose/please rows cite trapA whenever it exists
+        # UNLESS the ask itself is EG2-gated ("I have not authorized its
+        # transmission") - d_b6qwr5M72BGdAWHfov (compose+EG2+trapA) and the
+        # yday green row ffj (compose+EG2+trapB) both prove EG2-gated asks
+        # stay plain with no trap cite. trapB ("none of its scope matches")
+        # stays ignored in this family (Hkg, N5Kb, ffj greens).
+        _ask_text = ""
+        for src_ln in mlines:
+            if src_ln.get("lineId") == elid:
+                _ask_text = src_ln.get("text") or ""
+                break
         trap_family = any(
-            TRAP_FAMILY_CLAUSE in (ln.get("text") or "")
-            for _s, src_lines in _sources(dossier, "policy", "signed_internal")
-            for ln in src_lines)
+            "EVT-" in t and "authentic, but permits" in t
+            for t in lm.values()
+        ) and ENQUIRY_CLAUSE_2 not in _ask_text
         ordered = [e for e in (
             plid, trap_lid if trap_family else None, rlid, elid) if e]
         # raw_order=True: emitter guarantees the brute-verified GT order;
