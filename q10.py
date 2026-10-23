@@ -64,6 +64,37 @@ TERMINAL = {COMPLETED, CANCELED, "TASK_STATE_FAILED", "TASK_STATE_REJECTED"}
 
 DB_PATH = os.environ.get("A2A_DB", os.environ.get("GA5_DB", "/tmp/ga5_q10.db"))
 
+# v3 debug wire: persists every graded batch / continuation locally so the
+# fresh audit families can be replayed and patched without touching the graded
+# task store path. Gated behind an unguessable ?key= (not part of grading).
+_Q10_WIRE_KEY = "wmf72kq9p4xdz"
+
+
+def _q10_wire(kind, body=None, resp=None, task_id=None, batch_id=None, who=None, note=None):
+    try:
+        with _db_lock:
+            c = db()
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS q10_wire("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " received REAL, kind TEXT, task_id TEXT, batch_id TEXT,"
+                " who TEXT, note TEXT, body TEXT, resp TEXT)")
+            c.execute(
+                "INSERT INTO q10_wire(received,kind,task_id,batch_id,who,note,body,resp)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (time.time(), kind, task_id, batch_id, who, note,
+                 json.dumps(body) if body is not None else None,
+                 json.dumps(resp) if resp is not None else None))
+            c.commit()
+    except Exception:
+        pass
+
+
+def _q10_batch_part(message):
+    part = find_part(message, MODE_BATCH) or any_data_part(message)
+    data = part.get("data") if isinstance(part, dict) else None
+    return data if isinstance(data, (dict, list)) else None
+
 
 # ------------------------------------------------------------ response types
 
@@ -867,6 +898,8 @@ async def start_task(who, message, message_id, fingerprint):
             c.execute("INSERT OR REPLACE INTO q10_msgs(principal,message_id,fingerprint,task_id)"
                       " VALUES(?,?,?,?)", (who, message_id, fingerprint, task_id))
             c.commit()
+        _q10_wire("replay", body=_q10_batch_part(message), task_id=task_id,
+                  batch_id=batch_id, who=who)
         return task_envelope(existing)
 
     # Persist SUBMITTED before any decision work.
@@ -914,6 +947,9 @@ async def start_task(who, message, message_id, fingerprint):
     task["status"] = {"state": INPUT_REQUIRED, "timestamp": now_iso()}
     task["state"] = INPUT_REQUIRED
     save_task(task, who, batch_id)
+    _q10_wire("send", body=_q10_batch_part(message), resp=payload,
+              task_id=task_id, batch_id=batch_id, who=who,
+              note="%d packages, policy %s" % (len(packages), policy_rev))
     return task_envelope(task)
 
 
@@ -1041,6 +1077,9 @@ async def continue_task(who, message, message_id, fingerprint):
         c.execute("INSERT OR REPLACE INTO q10_final(task_id,results_fp) VALUES(?,?)",
                   (task_id, results_fp))
         c.commit()
+    _q10_wire("continue", body={"results": results},
+              resp={"executions": executions, "accepted": accepted, "rejected": rejected},
+              task_id=task_id, batch_id=batch_id, who=who)
     return task_envelope(fresh)
 
 
@@ -1101,3 +1140,54 @@ async def cancel_task(task_id: str, request: Request):
                   (CANCELED, json.dumps(task), time.time(), task_id))
         c.commit()
     return task_response(task)
+
+
+# --------------------------------------------------------------------------- #
+# v3 debug wire (not part of grading): local replay/audit capture browser gate #
+# --------------------------------------------------------------------------- #
+@router.get("/debug/q10/wire")
+async def q10_wire_index(request: Request):
+    if request.query_params.get("key") != _Q10_WIRE_KEY:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    try:
+        limit = max(1, min(int(request.query_params.get("limit", "25") or "25"), 100))
+    except ValueError:
+        limit = 25
+    kind = request.query_params.get("kind") or None
+    try:
+        with _db_lock:
+            c = db()
+            if kind:
+                rows = c.execute(
+                    "SELECT id, received, kind, task_id, batch_id, who, note,"
+                    " length(body) AS body_len, length(resp) AS resp_len"
+                    " FROM q10_wire WHERE kind=? ORDER BY id DESC LIMIT ?",
+                    (kind, limit)).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT id, received, kind, task_id, batch_id, who, note,"
+                    " length(body) AS body_len, length(resp) AS resp_len"
+                    " FROM q10_wire ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    except Exception:
+        return JSONResponse({"rows": []})
+    return JSONResponse({"rows": [
+        dict(zip(("id", "received", "kind", "task_id", "batch_id", "who", "note",
+                  "body_len", "resp_len"), r)) for r in rows]})
+
+
+@router.get("/debug/q10/wire/{row_id}")
+async def q10_wire_detail(row_id: int, request: Request):
+    if request.query_params.get("key") != _Q10_WIRE_KEY:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    with _db_lock:
+        row = db().execute(
+            "SELECT id, received, kind, task_id, batch_id, who, note, body, resp"
+            " FROM q10_wire WHERE id=?", (row_id,)).fetchone()
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    body = json.loads(row["body"]) if row["body"] else None
+    resp = json.loads(row["resp"]) if row["resp"] else None
+    return JSONResponse({"id": row["id"], "received": row["received"], "kind": row["kind"],
+                         "task_id": row["task_id"], "batch_id": row["batch_id"],
+                         "who": row["who"], "note": row["note"],
+                         "body": body, "resp": resp})

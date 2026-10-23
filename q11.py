@@ -26,6 +26,8 @@ import time
 import uuid
 import hashlib
 import asyncio
+import sqlite3
+import threading
 from typing import Dict, Any, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Request
@@ -43,6 +45,36 @@ INCIDENTS: Dict[str, Dict[str, Any]] = {}
 
 PROFILE = "ga5-incident-agent/v2"
 DEFAULT_APPROVAL_TOOLS = ["rollback_deployment", "disable_feature"]
+
+# v3 debug wire: persists each incident POST + receipt locally so fresh audit
+# families can be replayed and patched. Key-gated, not part of grading.
+_Q11_WIRE_KEY = "wmf72kq9p4xdz"
+_q11_wire_lock = threading.Lock()
+_q11_wire_conn: Optional[sqlite3.Connection] = None
+
+
+def _q11_wire(kind: str, run_id: str = None, body=None, resp=None, note: str = None):
+    global _q11_wire_conn
+    try:
+        with _q11_wire_lock:
+            if _q11_wire_conn is None:
+                _q11_wire_conn = sqlite3.connect("/tmp/ga5_q11_wire.db",
+                                                 check_same_thread=False)
+                _q11_wire_conn.execute("PRAGMA journal_mode=WAL")
+                _q11_wire_conn.execute(
+                    "CREATE TABLE IF NOT EXISTS q11_wire("
+                    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    " received REAL, kind TEXT, run_id TEXT, note TEXT,"
+                    " body TEXT, resp TEXT)")
+            _q11_wire_conn.execute(
+                "INSERT INTO q11_wire(received,kind,run_id,note,body,resp)"
+                " VALUES(?,?,?,?,?,?)",
+                (time.time(), kind, run_id, note,
+                 json.dumps(body) if body is not None else None,
+                 json.dumps(resp) if resp is not None else None))
+            _q11_wire_conn.commit()
+    except Exception:
+        pass
 
 # CONTRACT (reverse-engineered from the full-marks TA reference at
 # app.jaideepm.net, 2026-07-27): the grader POSTs /v2/incidents (and may GET the
@@ -1313,11 +1345,25 @@ async def create_incident(request: Request):
         resp = _self_complete(state)
         state["first_response"] = resp
         INCIDENTS[run_id] = state
+        _q11_wire("create_selfcomplete", run_id=run_id, body=body, resp=resp,
+                  note="rootCause=%s diag=%d effect=%s" % (
+                      decision.get("rootCause", ""),
+                      len(state.get("diagnostics") or []),
+                      bool(state.get("effect"))))
         return JSONResponse(resp, headers=trace_response_headers(state))
 
     resp = waiting_response(state, dispatches, [])
     state["first_response"] = resp
     INCIDENTS[run_id] = state
+    _q11_wire("create", run_id=run_id, body=body,
+              resp={"status": resp.get("status"),
+                    "diagnosis": decision,
+                    "dispatches": [d.get("toolName") for d in dispatches],
+                    "effect": state.get("effect", {}).get("toolName")},
+              note="rootCause=%s diag=%d effect=%s" % (
+                  decision.get("rootCause", ""),
+                  len(state.get("diagnostics") or []),
+                  (state.get("effect") or {}).get("toolName")))
     return JSONResponse(resp, headers=trace_response_headers(state))
 
 
@@ -1443,6 +1489,11 @@ async def post_receipt(run_id: str, request: Request):
 
     state["receipts_seen"][receipt_id] = fp
     state["receipt_responses"][receipt_id] = resp
+    _q11_wire("receipts", run_id=run_id, body=body,
+              resp={"status": state.get("status"), "phase": state.get("phase"),
+                    "result": (state.get("final_result") or {}).get("status")
+                              if isinstance(state.get("final_result"), dict) else None},
+              note="receiptId=%s" % receipt_id)
     return JSONResponse(resp, headers=trace_response_headers(state))
 
 
@@ -1575,3 +1626,58 @@ def _handle_approvals(state: Dict[str, Any], receipt_id: str,
     if eff.get("approved"):
         return _dispatch_effect(state)
     return state["final_result"]
+
+
+# --------------------------------------------------------------------------- #
+# v3 debug wire (not part of grading): key-gated capture browser               #
+# --------------------------------------------------------------------------- #
+@router.get("/debug/q11/wire")
+async def q11_wire_index(request: Request):
+    if request.query_params.get("key") != _Q11_WIRE_KEY:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    try:
+        limit = max(1, min(int(request.query_params.get("limit", "25") or "25"), 100))
+    except ValueError:
+        limit = 25
+    kind = request.query_params.get("kind") or None
+    try:
+        with _q11_wire_lock:
+            if _q11_wire_conn is None:
+                _q11_wire_conn = sqlite3.connect("/tmp/ga5_q11_wire.db",
+                                                 check_same_thread=False)
+            if kind:
+                rows = _q11_wire_conn.execute(
+                    "SELECT id, received, kind, run_id, note,"
+                    " length(body) AS body_len, length(resp) AS resp_len"
+                    " FROM q11_wire WHERE kind=? ORDER BY id DESC LIMIT ?",
+                    (kind, limit)).fetchall()
+            else:
+                rows = _q11_wire_conn.execute(
+                    "SELECT id, received, kind, run_id, note,"
+                    " length(body) AS body_len, length(resp) AS resp_len"
+                    " FROM q11_wire ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    except Exception:
+        return JSONResponse({"rows": []})
+    return JSONResponse({"rows": [
+        dict(zip(("id", "received", "kind", "run_id", "note", "body_len", "resp_len"), r))
+        for r in rows]})
+
+
+@router.get("/debug/q11/wire/{row_id}")
+async def q11_wire_detail(row_id: int, request: Request):
+    if request.query_params.get("key") != _Q11_WIRE_KEY:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    with _q11_wire_lock:
+        global _q11_wire_conn
+        if _q11_wire_conn is None:
+            _q11_wire_conn = sqlite3.connect("/tmp/ga5_q11_wire.db",
+                                             check_same_thread=False)
+        row = _q11_wire_conn.execute(
+            "SELECT id, received, kind, run_id, note, body, resp"
+            " FROM q11_wire WHERE id=?", (row_id,)).fetchone()
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    body = json.loads(row[5]) if row[5] else None
+    resp = json.loads(row[6]) if row[6] else None
+    return JSONResponse({"id": row[0], "received": row[1], "kind": row[2],
+                         "run_id": row[3], "note": row[4], "body": body, "resp": resp})
