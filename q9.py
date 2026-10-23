@@ -513,6 +513,15 @@ ENQUIRY_CLAUSE_3 = "unsent status note"
 # request to prepare text, not to deliver it." — no EG1-3 phrase anywhere.
 PREPARE_ONLY_CLAUSE = "this is a request to prepare text, not to deliver it"
 ENQUIRY_RECORD_CLAUSE = "its current public status is exactly"
+# v8: the trap line ("Approval ... is authentic, but permits sending to ...")
+# is cited only in dossiers whose draft authority is the clause-3 clone
+# ("Unverified enquiries ...") — yesterday's digest-verified trap family
+# ([policy, trap, record, ask]). Dossiers whose authority is the clause-1/2
+# clone ("may be written up in the mailbox" / "incoming status request")
+# treat the trap as a decoy: GT there is the plain [policy, record, ask]
+# (today's accepted c1 doors and HkgKxge7gi; rejected 23 Oct c2+trap row
+# d_b6qwr5M72 came back accepted=false with the 4-line set).
+TRAP_FAMILY_CLAUSE = "Unverified enquiries permit preparing an unsent response only"
 
 Q = "[“\"]([^”\"]+)[”\"]"
 # v3 fresh-audit re-skins: "Approval EVT-... permits one delivery-status notice for" |
@@ -732,7 +741,15 @@ def deterministic_decision(dossier):
         # The ordered build below replaces the previous [policy, record,
         # ask, +trap] append, which only scored green when the dossier's
         # line ids happened to sort into GT order.
-        ordered = [e for e in (plid, trap_lid, rlid, elid) if e]
+        # v8: the trap detail line belongs to the clause-3-clone family only.
+        # For clause-1/2 authorities the trap is a decoy and GT is the plain
+        # [policy, record, ask] set.
+        trap_family = any(
+            TRAP_FAMILY_CLAUSE in (ln.get("text") or "")
+            for _s, src_lines in _sources(dossier, "policy", "signed_internal")
+            for ln in src_lines)
+        ordered = [e for e in (
+            plid, trap_lid if trap_family else None, rlid, elid) if e]
         # raw_order=True: emitter guarantees the brute-verified GT order;
         # build_proposal must not re-sort.
         return {"action": "create_draft", "evidence": ordered,
