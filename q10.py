@@ -401,6 +401,18 @@ DECISIVE_SIGNALS = [
         r"the same signed commercial invoice\b",
         r"the signed commercial invoice is identical",
         r"second payment would be a duplicate",
+        # v4 fresh-audit family (captured batches a998e821 / 72742a29):
+        # re-imaged duplicate "The incoming file is another image of invoice
+        # A, not a distinct invoice B ... Treat the renewed request as an
+        # already-paid duplicate"
+        r"another image of invoice",
+        r"not a distinct invoice",
+        r"already-paid duplicate",
+        # same family, second phrasing: "The obligation has been discharged;
+        # paying the scan again is prohibited"
+        r"second scan of one obligation",
+        r"paying the scan again is prohibited",
+        r"completed disbursement references the very billing instrument",
     ]),
     ("open_exception", [
         r"exception workflow",
@@ -412,6 +424,12 @@ DECISIVE_SIGNALS = [
         r"outside the permitted reconciliation tolerance",
         r"contradictory signed records",
         r"does not reconcile with the controlling order",
+        # v4 fresh-audit family: amount disagreement with no superseding
+        # corrected instrument ("...belongs in the documented exception
+        # process, not payment or ordinary verification")
+        r"does not agree with the amount due",
+        r"no superseding corrected instrument",
+        r"belongs in the documented exception process",
     ]),
     ("hold_invoice", [
         r"destination-account change",
@@ -424,6 +442,12 @@ DECISIVE_SIGNALS = [
         r"forbids remittance against changed instructions",
         r"until the callback closes",
         r"out-of-band check is pending",
+        # v4 fresh-audit family: remittance identity check ("payment
+        # destination different from the vendor's registered account ...
+        # must remain paused until that independent identity check closes")
+        r"payment destination different from",
+        r"remittance must remain paused",
+        r"previously verified contact number has not yet returned",
     ]),
     ("request_approval", [
         r"delegation ceiling",
@@ -449,6 +473,13 @@ DECISIVE_SIGNALS = [
         r"for a different signed commercial invoice",
         r"No payment was made for this exact invoice identity",
         r"it can be settled",
+        # v4 fresh-audit family (captured xqJ9BU / CoTCdx): twin totals —
+        # "Two legitimate purchases happen to have identical totals ... the
+        # other is payable" (a different purchase is NOT a duplicate)
+        r"two legitimate purchases happen to have identical totals",
+        r"the other is payable",
+        r"only the first obligation was discharged",
+        r"second purchase has valid authorization and goods received",
     ]),
 ]
 
@@ -707,8 +738,16 @@ def decide(pkg):
     action = classify_decisive(text) or heuristic_action(text)
     facts = cover_facts(pkg) or heuristic_facts(pkg, text)
     action = apply_authority_rule(text[:1400], facts, action)
-    refs = BRACKET_REF.findall(text)[:3] or mine_refs(text)
-    rationale = build_rationale(action, refs, facts, text[:400])
+    # v4: when the decisive paragraph exists but its wording is unknown, its
+    # own refs are still the correct evidence — never pull the cover-sheet
+    # ref via the global first-3 scan.
+    if paragraph:
+        refs = BRACKET_REF.findall(paragraph)[:3]
+    else:
+        refs = []
+    if not refs:
+        refs = BRACKET_REF.findall(text)[:3] or mine_refs(text)
+    rationale = build_rationale(action, refs, facts, paragraph or text[:400])
     return {"action": action, "facts": facts, "evidenceRefs": refs,
             "rationale": rationale}
 
