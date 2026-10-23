@@ -49,8 +49,76 @@ DEFAULT_APPROVAL_TOOLS = ["rollback_deployment", "disable_feature"]
 # v3 debug wire: persists each incident POST + receipt locally so fresh audit
 # families can be replayed and patched. Key-gated, not part of grading.
 _Q11_WIRE_KEY = "wmf72kq9p4xdz"
+_Q11_WIRE_DB = os.environ.get("Q11_WIRE_DB", "/tmp/ga5_q11_wire.db")
 _q11_wire_lock = threading.Lock()
+_q11_state_lock = threading.Lock()
 _q11_wire_conn: Optional[sqlite3.Connection] = None
+_DEBUG_REDACT_KEYS = {
+    "sensitive", "transcript", "arguments", "nonce", "approvalnonce",
+    "authorization", "accesstoken", "privatenote", "prompt", "modelprompt",
+    "toolresult", "result",
+}
+
+
+def _debug_safe(value: Any) -> Any:
+    """Redact private incident/receipt material from diagnostic storage and reads."""
+    if isinstance(value, dict):
+        return {key: (_REDACTED if key.lower() in _DEBUG_REDACT_KEYS else _debug_safe(item))
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [_debug_safe(item) for item in value]
+    return value
+
+
+def _q11_state_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(_Q11_WIRE_DB, timeout=10.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("CREATE TABLE IF NOT EXISTS q11_runs("
+                 " run_id TEXT PRIMARY KEY, state TEXT NOT NULL)")
+    return conn
+
+
+def _load_incident(run_id: str) -> Optional[Dict[str, Any]]:
+    with _q11_state_lock:
+        conn = _q11_state_connect()
+        try:
+            row = conn.execute("SELECT state FROM q11_runs WHERE run_id=?", (run_id,)).fetchone()
+        finally:
+            conn.close()
+    if row is None:
+        return None
+    try:
+        state = json.loads(row[0])
+    except (TypeError, json.JSONDecodeError):
+        raise HTTPException(status_code=500, detail="Stored incident state is invalid")
+    if not isinstance(state, dict) or state.get("runId") != run_id:
+        raise HTTPException(status_code=500, detail="Stored incident state is invalid")
+    return state
+
+
+def _persist_incident(state: Dict[str, Any]) -> None:
+    run_id = state.get("runId")
+    if not isinstance(run_id, str) or not run_id:
+        raise HTTPException(status_code=500, detail="Incident state has no runId")
+    blob = canonical(state)
+    with _q11_state_lock:
+        conn = _q11_state_connect()
+        try:
+            conn.execute("INSERT OR REPLACE INTO q11_runs(run_id,state) VALUES(?,?)",
+                         (run_id, blob))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _incident(run_id: str) -> Optional[Dict[str, Any]]:
+    state = INCIDENTS.get(run_id)
+    if state is None:
+        state = _load_incident(run_id)
+        if state is not None:
+            INCIDENTS[run_id] = state
+    return state
 
 
 def _q11_wire(kind: str, run_id: str = None, body=None, resp=None, note: str = None):
@@ -58,7 +126,7 @@ def _q11_wire(kind: str, run_id: str = None, body=None, resp=None, note: str = N
     try:
         with _q11_wire_lock:
             if _q11_wire_conn is None:
-                _q11_wire_conn = sqlite3.connect("/tmp/ga5_q11_wire.db",
+                _q11_wire_conn = sqlite3.connect(_Q11_WIRE_DB,
                                                  check_same_thread=False)
                 _q11_wire_conn.execute("PRAGMA journal_mode=WAL")
                 _q11_wire_conn.execute(
@@ -70,8 +138,8 @@ def _q11_wire(kind: str, run_id: str = None, body=None, resp=None, note: str = N
                 "INSERT INTO q11_wire(received,kind,run_id,note,body,resp)"
                 " VALUES(?,?,?,?,?,?)",
                 (time.time(), kind, run_id, note,
-                 json.dumps(body) if body is not None else None,
-                 json.dumps(resp) if resp is not None else None))
+                 json.dumps(_debug_safe(body)) if body is not None else None,
+                 json.dumps(_debug_safe(resp)) if resp is not None else None))
             _q11_wire_conn.commit()
     except Exception:
         pass
@@ -1230,6 +1298,8 @@ async def create_incident(request: Request):
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=422, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="JSON body must be an object")
 
     if body.get("profile") != PROFILE:
         raise HTTPException(status_code=422, detail="Unsupported profile")
@@ -1250,8 +1320,8 @@ async def create_incident(request: Request):
     # terminal state survives a replay: an exact replay-POST returns the SAME
     # state a concurrent GET would (terminal once completed/failed, otherwise the
     # last persisted waiting envelope) — never the stale first waiting response.
-    if run_id in INCIDENTS:
-        existing = INCIDENTS[run_id]
+    existing = _incident(run_id)
+    if existing is not None:
         if existing["req_fp"] != req_fp:
             raise HTTPException(status_code=409, detail="runId content conflict")
         if existing["status"] in ("completed", "failed"):
@@ -1345,6 +1415,7 @@ async def create_incident(request: Request):
         resp = _self_complete(state)
         state["first_response"] = resp
         INCIDENTS[run_id] = state
+        _persist_incident(state)
         _q11_wire("create_selfcomplete", run_id=run_id, body=body, resp=resp,
                   note="rootCause=%s diag=%d effect=%s" % (
                       decision.get("rootCause", ""),
@@ -1355,11 +1426,12 @@ async def create_incident(request: Request):
     resp = waiting_response(state, dispatches, [])
     state["first_response"] = resp
     INCIDENTS[run_id] = state
+    _persist_incident(state)
     _q11_wire("create", run_id=run_id, body=body,
               resp={"status": resp.get("status"),
                     "diagnosis": decision,
                     "dispatches": [d.get("toolName") for d in dispatches],
-                    "effect": state.get("effect", {}).get("toolName")},
+                    "effect": (state.get("effect") or {}).get("toolName")},
               note="rootCause=%s diag=%d effect=%s" % (
                   decision.get("rootCause", ""),
                   len(state.get("diagnostics") or []),
@@ -1372,7 +1444,7 @@ async def create_incident(request: Request):
 # --------------------------------------------------------------------------- #
 @router.get("/v2/incidents/{run_id}")
 async def get_incident(run_id: str):
-    state = INCIDENTS.get(run_id)
+    state = _incident(run_id)
     if not state:
         raise HTTPException(status_code=404, detail="Unknown runId")
     if state["status"] in ("completed", "failed"):
@@ -1458,13 +1530,15 @@ def _find_action(state: Dict[str, Any], action_id: str, call_id: str) -> Optiona
 # --------------------------------------------------------------------------- #
 @router.post("/v2/incidents/{run_id}/receipts")
 async def post_receipt(run_id: str, request: Request):
-    state = INCIDENTS.get(run_id)
+    state = _incident(run_id)
     if not state:
         raise HTTPException(status_code=404, detail="Unknown runId")
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=422, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="JSON body must be an object")
 
     receipt_id = body.get("receiptId")
     if not receipt_id:
@@ -1489,6 +1563,7 @@ async def post_receipt(run_id: str, request: Request):
 
     state["receipts_seen"][receipt_id] = fp
     state["receipt_responses"][receipt_id] = resp
+    _persist_incident(state)
     _q11_wire("receipts", run_id=run_id, body=body,
               resp={"status": state.get("status"), "phase": state.get("phase"),
                     "result": (state.get("final_result") or {}).get("status")
@@ -1633,6 +1708,7 @@ def _handle_approvals(state: Dict[str, Any], receipt_id: str,
 # --------------------------------------------------------------------------- #
 @router.get("/debug/q11/wire")
 async def q11_wire_index(request: Request):
+    global _q11_wire_conn
     if request.query_params.get("key") != _Q11_WIRE_KEY:
         return JSONResponse({"error": "forbidden"}, status_code=403)
     try:
@@ -1643,7 +1719,7 @@ async def q11_wire_index(request: Request):
     try:
         with _q11_wire_lock:
             if _q11_wire_conn is None:
-                _q11_wire_conn = sqlite3.connect("/tmp/ga5_q11_wire.db",
+                _q11_wire_conn = sqlite3.connect(_Q11_WIRE_DB,
                                                  check_same_thread=False)
             if kind:
                 rows = _q11_wire_conn.execute(
@@ -1677,7 +1753,7 @@ async def q11_wire_detail(row_id: int, request: Request):
             " FROM q11_wire WHERE id=?", (row_id,)).fetchone()
     if not row:
         return JSONResponse({"error": "not found"}, status_code=404)
-    body = json.loads(row[5]) if row[5] else None
-    resp = json.loads(row[6]) if row[6] else None
+    body = _debug_safe(json.loads(row[5])) if row[5] else None
+    resp = _debug_safe(json.loads(row[6])) if row[6] else None
     return JSONResponse({"id": row[0], "received": row[1], "kind": row[2],
                          "run_id": row[3], "note": row[4], "body": body, "resp": resp})
