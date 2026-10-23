@@ -741,6 +741,30 @@ def deterministic_decision(dossier):
         elid2, _em2 = _find(mlines, re.compile(re.escape(ENQUIRY_CLAUSE_2)))
         _g1, _em = _find(mlines, re.compile(re.escape(ENQUIRY_CLAUSE)))
         _g3, _em = _find(mlines, re.compile(re.escape(ENQUIRY_CLAUSE_3)))
+        # v10: the could+EG2 confirm bet died on the 24 Oct receipt
+        # (d_EsenywgE3tpVzi4p7k rejected at [c3, gateway, record]) and the
+        # trap-4-line draft died earlier (d_qJzXyqG3JgyCtx9uEr at
+        # [c3, trap, record, ask]). Remaining coherent shape: create_draft
+        # citing authority (clone), the send-exclusion (trapA), and BOTH
+        # argument sources (gateway recipient, record ref/status) - the
+        # ask line itself is not cited (no could-family green row cites
+        # it; weaRkst [policy, gateway, record] set the precedent).
+        elidX, _emX = _find(mlines, re.compile(re.escape("Could you write")))
+        if elid2 is not None and elidX is not None and _g1 is None and _g3 is None:
+            fields = {"recipient": mm.group(1), "referenceId": rm.group(1),
+                      "status": rm.group(3)}
+            dplid = _rule_line(dossier, "create_draft")
+            _lmx = {ln.get("lineId"): (ln.get("text") or "")
+                    for src in (dossier.get("sources") or [])
+                    for ln in (src.get("lines") or []) if isinstance(ln, dict)}
+            _tlid = None
+            for _til, _txt in _lmx.items():
+                if _txt and re.search(r"Approval\s+EVT-[A-Z0-9]+\s+is\s+authentic,\s+but\s+permits", _txt):
+                    _tlid = _til
+                    break
+            evx = [e for e in (dplid, _tlid, mlid, rlid) if e]
+            return {"action": "create_draft", "evidence": evx,
+                    "fields": fields, "raw_order": True}
         if elid2 is not None and _g1 is None and _g3 is None:
             fields = {"claimedSender": mm.group(1), "referenceId": rm.group(1)}
             plid = _rule_line(dossier, "request_confirmation") or \
