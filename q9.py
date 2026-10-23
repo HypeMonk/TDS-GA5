@@ -505,23 +505,11 @@ CARRIER_CLAUSE = "to change delivery_window to the exact value"
 MISMATCH_CLAUSE = "the requested change therefore requires"
 ENQUIRY_CLAUSE = "I have not asked you to send anything yet"
 ENQUIRY_CLAUSE_2 = "I have not authorized its transmission"
-# v4 fresh-audit wording (captured KqnVSA): "Compose an unsent status note
-# for order ORD-...; ... this is a request to prepare text, not to deliver it."
 ENQUIRY_CLAUSE_3 = "unsent status note"
-# v7 worded gate for the third enquiry subfamily (captured veanLXXnqS):
-# "Could you write a status update concerning order ORD-...; ... this is a
-# request to prepare text, not to deliver it." — no EG1-3 phrase anywhere.
 PREPARE_ONLY_CLAUSE = "this is a request to prepare text, not to deliver it"
 ENQUIRY_RECORD_CLAUSE = "its current public status is exactly"
-# v8: the trap line ("Approval ... is authentic, but permits sending to ...")
-# is cited only in dossiers whose draft authority is the clause-3 clone
-# ("Unverified enquiries ...") — yesterday's digest-verified trap family
-# ([policy, trap, record, ask]). Dossiers whose authority is the clause-1/2
-# clone ("may be written up in the mailbox" / "incoming status request")
-# treat the trap as a decoy: GT there is the plain [policy, record, ask]
-# (today's accepted c1 doors and HkgKxge7gi; rejected 23 Oct c2+trap row
-# d_b6qwr5M72 came back accepted=false with the 4-line set).
-TRAP_FAMILY_CLAUSE = "Unverified enquiries permit preparing an unsent response only"
+EXCLUDED_APPROVAL_CONCLUSION = "The signed approval does not permit a notice to this sender for the current status"
+RE_EXCLUDED_APPROVAL = re.compile(r"Approval (EVT-[A-Z0-9]+) is authentic, but permits sending to (\S+), not to the current sender (\S+)\.")
 
 Q = "[“\"]([^”\"]+)[”\"]"
 # v3 fresh-audit re-skins: "Approval EVT-... permits one delivery-status notice for" |
@@ -686,150 +674,45 @@ def deterministic_decision(dossier):
                              ENQUIRY_CLAUSE_2, ENQUIRY_CLAUSE_3, PREPARE_ONLY_CLAUSE)
     rlid, rm = _find(rlines, RE_ENQUIRY_RECORD)
     mlid, mm = _find(mlines, RE_GATEWAY)
-    if rm and mm:
-        # v7 prep-gate subfamily: when the enquiry ask carries ONLY the
-        # prepare-only phrase (no EG1-3 wording) the grader-receipted GT
-        # is request_confirmation, not create_draft (see the 23 Oct
-        # rejected receipt: GT action request_confirmation). Evidence is
-        # the three hint anchors in their literal order: authority
-        # (policy), provenance (gateway sender line), case state
-        # (record). claimedSender = the gateway-recorded sender,
-        # referenceId = the dossier's ORD id.
-        prep_lid, pm = _find(mlines, re.compile(re.escape(PREPARE_ONLY_CLAUSE)))
-        if prep_lid is not None:
-            prep_text = ""
-            for src_ln in mlines:
-                if src_ln.get("lineId") == prep_lid:
-                    prep_text = src_ln.get("text") or ""
-                    break
-            if not any(c in prep_text for c in
-                       (ENQUIRY_CLAUSE, ENQUIRY_CLAUSE_2, ENQUIRY_CLAUSE_3)):
-                c3_authority = any(
-                    TRAP_FAMILY_CLAUSE in (ln.get("text") or "")
-                    for _s, src_lines in _sources(dossier, "policy", "signed_internal")
-                    for ln in src_lines)
-                fields = {"claimedSender": mm.group(1), "referenceId": rm.group(1)}
-                plid = _rule_line(dossier, "request_confirmation") or \
-                    _rule_line(dossier, "create_draft")
-                # v9 could+prep-only subfamily splits by authority clone.
-                # c3 ("Delivery needs a later human authorization") received
-                # GT confirm [policy, gateway, record] (23 Oct accepted
-                # receipt). c2 ("may be written up in the mailbox") rejected
-                # the confirm set (d_LwajM8YXkYjZaBhBzn) while its
-                # compose-twins scored green on [policy, record, ask], so GT
-                # for c2 here is create_draft with the plain set.
-                if not c3_authority:
-                    dfields = {"recipient": mm.group(1), "referenceId": rm.group(1),
-                               "status": rm.group(3)}
-                    dplid = _rule_line(dossier, "create_draft")
-                    return {"action": "create_draft",
-                            "evidence": [e for e in (dplid, rlid, prep_lid) if e],
-                            "fields": dfields, "raw_order": True}
-                return {"action": "request_confirmation",
-                        "evidence": [e for e in (plid, mlid, rlid) if e],
-                        "fields": fields, "raw_order": True}
-        # v9 EG2 gate force: only the "Could you write" verb triggers it.
-        # Could-verb asks ("Could you write a status update ...and I have
-        # not authorized its transmission") are sender-disavowed - GT is
-        # request_confirmation with [policy, gateway, record] for every
-        # clone (plain draft shapes were rejected: d_qJzXyqG3JgyCtx9uEr
-        # [c3, trap, record, ask]; d_F5CddjYZeRDnaUmkif [c2, record, ask]).
-        # Compose asks carrying EG2 ("Compose an unsent status note ...and
-        # I have not authorized its transmission") stay plain drafts - the
-        # yday green row d_VV5sBh5NffjMrsNP9r fixes GT = [policy, record,
-        # ask] exactly (compose+EG2+c3 clone, trap-B ignored).
-        elid2, _em2 = _find(mlines, re.compile(re.escape(ENQUIRY_CLAUSE_2)))
-        _g1, _em = _find(mlines, re.compile(re.escape(ENQUIRY_CLAUSE)))
-        _g3, _em = _find(mlines, re.compile(re.escape(ENQUIRY_CLAUSE_3)))
-        # v10: the could+EG2 confirm bet died on the 24 Oct receipt
-        # (d_EsenywgE3tpVzi4p7k rejected at [c3, gateway, record]) and the
-        # trap-4-line draft died earlier (d_qJzXyqG3JgyCtx9uEr at
-        # [c3, trap, record, ask]). Remaining coherent shape: create_draft
-        # citing authority (clone), the send-exclusion (trapA), and BOTH
-        # argument sources (gateway recipient, record ref/status) - the
-        # ask line itself is not cited (no could-family green row cites
-        # it; weaRkst [policy, gateway, record] set the precedent).
-        elidX, _emX = _find(mlines, re.compile(re.escape("Could you write")))
-        if elid2 is not None and elidX is not None and _g1 is None and _g3 is None:
-            fields = {"recipient": mm.group(1), "referenceId": rm.group(1),
-                      "status": rm.group(3)}
-            dplid = _rule_line(dossier, "create_draft")
-            _lmx = {ln.get("lineId"): (ln.get("text") or "")
-                    for src in (dossier.get("sources") or [])
-                    for ln in (src.get("lines") or []) if isinstance(ln, dict)}
-            _tlid = None
-            for _til, _txt in _lmx.items():
-                if _txt and re.search(
-                        r"Approval\s+EVT-[A-Z0-9]+\s+is\s+authentic,\s+but\s+permits"
-                        r"|A signed authorization applies to another customer",
-                        _txt):
-                    _tlid = _til
-                    break
-            evx = [e for e in (dplid, _tlid, mlid, rlid) if e]
-            return {"action": "create_draft", "evidence": evx,
-                    "fields": fields, "raw_order": True}
-        if elid2 is not None and _g1 is None and _g3 is None:
-            fields = {"claimedSender": mm.group(1), "referenceId": rm.group(1)}
-            plid = _rule_line(dossier, "request_confirmation") or \
-                _rule_line(dossier, "create_draft")
-            return {"action": "request_confirmation",
-                    "evidence": [e for e in (plid, mlid, rlid) if e],
-                    "fields": fields, "raw_order": True}
+    plid = _rule_line(dossier, "create_draft")
+    if rm and mm and plid:
+        # Draft permission is independent of the verb or policy paraphrase.
+        # An actual authenticated identity conflict is handled above.
+        clauses = (ENQUIRY_CLAUSE, ENQUIRY_CLAUSE_2, ENQUIRY_CLAUSE_3, PREPARE_ONLY_CLAUSE)
+        asks = [ln for ln in mlines
+                if any(c in (ln.get("text") or "") for c in clauses)]
+        if len(asks) != 1:
+            return None
+        ask = asks[0]
+        requested = re.search(r"\border (ORD-[A-Z0-9]+)\b", ask.get("text") or "")
+        if requested is None or requested.group(1) != rm.group(1):
+            return None
+        senders = {m.group(1) for _s, lines in _sources(dossier, "message", "external_unverified")
+                   for ln in lines for m in [RE_GATEWAY.search(ln.get("text") or "")] if m}
+        records = {m.groups() for _s, lines in _sources(dossier, "record", "authenticated_internal")
+                   for ln in lines for m in [RE_ENQUIRY_RECORD.search(ln.get("text") or "")] if m}
+        if senders != {mm.group(1)} or records != {rm.groups()}:
+            return None
         fields = {"recipient": mm.group(1), "referenceId": rm.group(1), "status": rm.group(3)}
-        plid = _rule_line(dossier, "create_draft")
-        elid, _em = _find(mlines, re.compile(re.escape(ENQUIRY_CLAUSE) + "|" + re.escape(ENQUIRY_CLAUSE_2) + "|" + re.escape(ENQUIRY_CLAUSE_3)))
-        evidence = [e for e in (plid, rlid, elid) if e]
-        # v3 fresh-audit trap family: a SIGNED approval deliberately does NOT
-        # cover this sender/status ("Approval EVT-... is authentic, but permits
-        # sending to <another>, not to the current sender"). The operative
-        # non-coverage line is part of the smallest sufficient evidence for the
-        # draft: it is the scoped fact that rules out send_approved_notice.
-        # Plain dossiers' empty-register lines ("the approval register contains
-        # a closed notice...") are NOT cited — green twin proposals prove the
-        # expected set there is just [policy, record, enquiry].
-        # v4 digest-verified correction: the ground-truth receipt for the trap
-        # family is exactly [policy, trap-detail, record, ask] — the CONCLUSION
-        # line ("The signed approval does not permit a notice to this sender
-        # for the current status") is NOT part of the expected evidence. Citing
-        # it made the set non-minimal and the receipt was marked accepted=false.
-        lm = {ln.get("lineId"): (ln.get("text") or "")
-              for src in (dossier.get("sources") or [])
-              for ln in (src.get("lines") or []) if isinstance(ln, dict)}
-        trap_lid = None
-        for pat in (r"Approval\s+EVT-[A-Z0-9]+\s+is\s+authentic,\s+but\s+permits",):
-            for lid, text in lm.items():
-                if text and re.search(pat, text):
-                    trap_lid = lid
-                    break        # v5: GT evidence ORDER is [policy, trap, record, ask] - verified
-        # byte-exact by the 22 Oct digest brute force (brute2_result.txt).
-        # The ordered build below replaces the previous [policy, record,
-        # ask, +trap] append, which only scored green when the dossier's
-        # line ids happened to sort into GT order.
-        # v8: the trap detail line belongs to the clause-3-clone family only.
-        # For clause-1/2 authorities the trap is a decoy and GT is the plain
-        # [policy, record, ask] set.
-        # v11 correction from d_r2muVMc85YN8JSFQY6: compose+prep rows cite
-        # trapA for the c2 clone too (c3 twin UvKUSH proved the shape). The
-        # real invariant: compose/please rows cite trapA whenever it exists
-        # UNLESS the ask itself is EG2-gated ("I have not authorized its
-        # transmission") - d_b6qwr5M72BGdAWHfov (compose+EG2+trapA) and the
-        # yday green row ffj (compose+EG2+trapB) both prove EG2-gated asks
-        # stay plain with no trap cite. trapB ("none of its scope matches")
-        # stays ignored in this family (Hkg, N5Kb, ffj greens).
-        _ask_text = ""
-        for src_ln in mlines:
-            if src_ln.get("lineId") == elid:
-                _ask_text = src_ln.get("text") or ""
-                break
-        trap_family = any(
-            "EVT-" in t and "authentic, but permits" in t
-            for t in lm.values()
-        ) and ENQUIRY_CLAUSE_2 not in _ask_text
-        ordered = [e for e in (
-            plid, trap_lid if trap_family else None, rlid, elid) if e]
-        # raw_order=True: emitter guarantees the brute-verified GT order;
-        # build_proposal must not re-sort.
-        return {"action": "create_draft", "evidence": ordered,
+        evidence = [plid, rlid, ask["lineId"]]
+
+        # Preserve the accepted plain-request shape. For an authentic approval
+        # naming this sender but excluding delivery, retain both its concrete
+        # scope and explicit noncoverage statement. A rejected proposal's hash
+        # cannot establish that either of these signed facts is unnecessary.
+        exclusions = []
+        for _src, lines in _sources(dossier, "approval", "signed_internal"):
+            for ln in lines:
+                scope = RE_EXCLUDED_APPROVAL.search(ln.get("text") or "")
+                if scope and scope.group(3) == mm.group(1) and scope.group(2) != mm.group(1):
+                    conclusion = next((item["lineId"] for item in lines
+                                       if EXCLUDED_APPROVAL_CONCLUSION in (item.get("text") or "")), None)
+                    exclusions.append([ln["lineId"]] + ([conclusion] if conclusion else []))
+        if len(exclusions) > 1:
+            return None
+        if exclusions:
+            evidence = [plid] + exclusions[0] + [rlid, ask["lineId"]]
+        return {"action": "create_draft", "evidence": evidence,
                 "fields": fields, "raw_order": True}
 
     return None
@@ -1012,9 +895,8 @@ def build_proposal(did, dossier, fingerprint, raw):
     if not evidence and line_ids:
         evidence = [line_ids[0]]
 
-    # v5: deterministic families may emit a byte-verified GT evidence order
-    # (raw_order=True -> trap family). Everything else keeps the historical
-    # sorted order that its accepted receipts were earned in.
+    # Preserve deterministic output ordering for exact cached replay.
+    # Grading and proposal digests compare evidence without regard to order.
     if not (isinstance(raw, dict) and raw.get("raw_order")):
         evidence = sorted(evidence)
 
@@ -1024,10 +906,6 @@ def build_proposal(did, dossier, fingerprint, raw):
         "action": action,
         "target": target,
         "payload": payload,
-        # v5: fresh_audit dossiers carrying raw_order=True (brute-verified
-        # GT slot order) already came through unsorted above; core and LLM
-        # paths keep the historical sorted order their receipts were earned
-        # in.
         "evidence": evidence,
     }
 
@@ -1083,6 +961,11 @@ async def do_propose(body):
         if stored_key == conflict_key:
             return stored_resp
         raise HTTPException(status_code=409, detail="evaluationId already used with different content")
+
+    verifier = body.get("receiptVerifier")
+    if not isinstance(verifier, dict) or verifier.get("algorithm") != "Ed25519":
+        raise HTTPException(status_code=422, detail="receiptVerifier must specify Ed25519")
+    receipt_public_key(verifier.get("publicKeyJwk"), status_code=422)
 
     fingerprints = [fingerprint_of(d) for d in dossiers]
 
@@ -1187,6 +1070,21 @@ def validate_commit(body):
         seen.add(call_id)
     return eval_id, input_digest, receipts
 
+def receipt_public_key(jwk, status_code=409):
+    if not isinstance(jwk, dict) or jwk.get("kty") != "OKP" or jwk.get("crv") != "Ed25519":
+        raise HTTPException(status_code=status_code, detail="missing or invalid Ed25519 receipt verifier")
+    x = jwk.get("x")
+    if not isinstance(x, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}=?", x):
+        raise HTTPException(status_code=status_code, detail="invalid receipt verifier public key")
+    try:
+        public_key = base64.b64decode(x + "=" * (-len(x) % 4), altchars=b"-_", validate=True)
+    except (ValueError, binascii.Error):
+        raise HTTPException(status_code=status_code, detail="invalid receipt verifier public key")
+    if len(public_key) != 32:
+        raise HTTPException(status_code=status_code, detail="invalid receipt verifier public key length")
+    return public_key
+
+
 def verify_receipt_signatures(eval_id, input_digest, receipts, jwk, profile):
     """Verify every Ed25519 receiptSignature, or reject the whole commit (409).
 
@@ -1200,15 +1098,7 @@ def verify_receipt_signatures(eval_id, input_digest, receipts, jwk, profile):
     reject-the-whole-commit case -> 409 (not 422: the only two malformed probes
     are a duplicate dossierId on propose and an unknown operation).
     """
-    if not isinstance(jwk, dict) or "x" not in jwk:
-        return  # no verifier was supplied with the proposal; nothing to check
-    try:
-        x = jwk["x"]
-        public_key = base64.urlsafe_b64decode(x + "=" * (-len(x) % 4))
-    except Exception:
-        return
-    if len(public_key) != 32:
-        return
+    public_key = receipt_public_key(jwk)
 
     seen_sigs = set()
     for r in receipts:
