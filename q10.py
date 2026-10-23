@@ -413,6 +413,16 @@ DECISIVE_SIGNALS = [
         r"second scan of one obligation",
         r"paying the scan again is prohibited",
         r"completed disbursement references the very billing instrument",
+        # v5 fresh-audit family (captured wave 2, tasks 06:2x-06:3x): scan
+        # recession variants — "Finance has already transferred funds ...
+        # reject the repeat presentation" / "anti-duplication control bars"
+        r"has already transferred funds against",
+        r"reuses that original document",
+        r"reject the repeat presentation",
+        r"cannot justify another transfer",
+        r"closed the purchase represented by the current signed document",
+        r"both intake records point to one instrument",
+        r"anti-duplication control bars a second disbursement",
     ]),
     ("open_exception", [
         r"exception workflow",
@@ -480,6 +490,16 @@ DECISIVE_SIGNALS = [
         r"the other is payable",
         r"only the first obligation was discharged",
         r"second purchase has valid authorization and goods received",
+        # v5 fresh-audit family (captured wave 2): same-supplier-and-total but
+        # a DIFFERENT commercial obligation — payable, never approval
+        r"discharged a separate commercial obligation",
+        r"so release this payment",
+        r"meets the settlement conditions",
+        r"remains unpaid",
+        r"authorize its payment",
+        r"contains no settlement of",
+        r"its underlying invoice is NOT the document now under review",
+        r"this claim concerns independently issued invoice",
     ]),
 ]
 
