@@ -68,7 +68,7 @@ DB_PATH = os.environ.get("A2A_DB", os.environ.get("GA5_DB", "/tmp/ga5_q10.db"))
 # v3 debug wire: persists every graded batch / continuation locally so the
 # fresh audit families can be replayed and patched without touching the graded
 # task store path. Gated behind an unguessable ?key= (not part of grading).
-_Q10_WIRE_KEY = "wmf72kq9p4xdz"
+_Q10_WIRE_KEY = os.environ.get("DEBUG_KEY", "")
 
 
 def _q10_wire(kind, body=None, resp=None, task_id=None, batch_id=None, who=None, note=None):
@@ -867,11 +867,167 @@ def distributed_decision(pkg):
             "unresolvedFacts": missing}
 
 
+_ARCHIVE_WORDS = re.compile(r"\b(?:archive|archived|historical|training|hypothetical|unrelated|superseded|illustrative)\b", re.I)
+
+
+def _semantic_amounts(text):
+    values = []
+    for currency, raw in AMOUNT_RE.findall(text):
+        amount = _money_minor(raw, currency)
+        value = (currency.upper(), amount)
+        if amount is not None and value not in values:
+            values.append(value)
+    return values
+
+
+def _semantic_invoice_record(text):
+    invoices = re.findall(r"\b(?:INV|INVOICE|BILL)[-/][A-Za-z0-9][A-Za-z0-9\-/]{2,}\b", text, re.I)
+    orders, amounts = re.findall(r"\bPO-[A-Z0-9-]+\b", text, re.I), _semantic_amounts(text)
+    if (len(set(invoices)) != 1 or len(set(orders)) != 1 or len(amounts) != 1
+            or not re.search(r"\b(?:signed|commercial instrument|issued invoice|invoice record)\b", text, re.I)):
+        return None
+    return invoices[0].upper(), orders[0].upper(), amounts[0]
+
+
+def _semantic_order_record(text):
+    orders, amounts = re.findall(r"\bPO-[A-Z0-9-]+\b", text, re.I), _semantic_amounts(text)
+    if (len(set(orders)) != 1 or not amounts
+            or not re.search(r"\b(?:purchase order|signed order|receiv\w*|goods|billed units|submitted invoice)\b", text, re.I)):
+        return None
+    return orders[0].upper(), amounts
+
+
+def _semantic_ledger_record(text):
+    if not re.search(r"\b(?:ledger|disbursement|paid|payment|settled)\b", text, re.I):
+        return None
+    orders, amounts = re.findall(r"\bPO-[A-Z0-9-]+\b", text, re.I), _semantic_amounts(text)
+    current = re.search(r"(?:current(?:ly)?\s+(?:submitted\s+)?(?:order|claim)|submitted order)\s+(?:is\s+)?(PO-[A-Z0-9-]+)", text, re.I)
+    paid = re.search(r"(?:settled|paid|discharged)(?:\s+(?:purchase\s+)?order|\s+against)?\s+(PO-[A-Z0-9-]+)", text, re.I)
+    vendor = re.search(r"(?:disbursement|payment|paid).{0,50}?\bto\s+(.+?)(?=\s+(?:previously\s+)?(?:settled|for|against)\b|[.;])", text, re.I)
+    if not amounts or not current or not vendor:
+        return None
+    paid_order = paid.group(1).upper() if paid else next((o.upper() for o in orders if o.upper() != current.group(1).upper()), current.group(1).upper())
+    return amounts[0], vendor.group(1).strip(" ,.;"), paid_order, current.group(1).upper()
+
+
+def _semantic_bank_record(text):
+    if not re.search(r"\b(?:bank|account|remittance|beneficiary|callback)\b", text, re.I):
+        return None
+    accounts = re.findall(r"\bAC-[A-Z0-9-]+\b", text, re.I)
+    if not accounts and not re.search(r"callback", text, re.I):
+        return None
+    pending = bool(re.search(r"\b(?:pending|awaiting|not yet|unverified)\b", text, re.I))
+    confirmed = bool(re.search(r"\b(?:confirmed|verified|established channel|completed)\b", text, re.I))
+    changed = len(set(a.upper() for a in accounts)) > 1 or bool(re.search(r"\b(?:changed|different|new|replaced)\b", text, re.I))
+    return changed, pending, confirmed
+
+
+def _semantic_ceiling_record(text):
+    if not re.search(r"\b(?:ceiling|authority|limit|threshold)\b", text, re.I):
+        return None
+    amounts = _semantic_amounts(text)
+    return amounts[0] if len(amounts) == 1 else None
+
+
+def semantic_distributed_decision(pkg):
+    """Relationship-based fallback for paraphrased current commercial records."""
+    records = []
+    for _doc, paragraph in _case_paragraphs(pkg):
+        match = BRACKET_REF.match(paragraph)
+        if match is None:
+            if paragraph and not _ARCHIVE_WORDS.search(paragraph):
+                return None
+            continue
+        if len(BRACKET_REF.findall(paragraph)) != 1:
+            return None
+        text = paragraph[match.end():].strip()
+        if _ARCHIVE_WORDS.search(text):
+            continue
+        roles = {
+            "invoice": _semantic_invoice_record(text), "order": _semantic_order_record(text),
+            "ledger": _semantic_ledger_record(text), "bank": _semantic_bank_record(text),
+            "ceiling": _semantic_ceiling_record(text),
+            "controls": bool(re.search(r"\b(?:duplicate|already (?:paid|settled)|second (?:payment|disbursement)|exception|bank change|remittance)\b", text, re.I)),
+        }
+        if not any(value for value in roles.values()):
+            return None
+        records.append((match.group(1), text, roles))
+    if not records:
+        return None
+
+    invoices = [(ref, role["invoice"]) for ref, _text, role in records if role["invoice"]]
+    orders = [(ref, role["order"]) for ref, _text, role in records if role["order"]]
+    ledgers = [(ref, role["ledger"]) for ref, _text, role in records if role["ledger"]]
+    banks = [(ref, role["bank"]) for ref, _text, role in records if role["bank"]]
+    ceilings = [(ref, role["ceiling"]) for ref, _text, role in records if role["ceiling"]]
+    controls = [ref for ref, _text, role in records if role["controls"]]
+    if len(invoices) > 1 or len(orders) > 1 or len(ledgers) > 1 or len(banks) > 1 or len(ceilings) > 1:
+        return None
+    invoice = invoices[0] if invoices else None
+    order = orders[0] if orders else None
+    ledger = ledgers[0] if ledgers else None
+    if not invoice and not order:
+        return None
+    current_order = invoice[1][1] if invoice else order[1][0]
+    currency, amount = invoice[1][2] if invoice else order[1][1][0]
+    if order:
+        order_amounts = set(order[1][1])
+        if order[1][0] != current_order or len(order_amounts) != 1 or (currency, amount) not in order_amounts:
+            action = "open_exception"
+        else:
+            action = None
+    else:
+        action = None
+    if ledger and ledger[1][3] != current_order:
+        return None
+    vendor = ledger[1][1] if ledger else "unknown"
+    invoice_id = invoice[1][0] if invoice else "unknown"
+    if action is None and ledger and ledger[1][2] == current_order:
+        if ledger[1][0] != (currency, amount):
+            return None
+        action = "reject_duplicate"
+    if action is None and banks and banks[0][1][0] and banks[0][1][1] and not banks[0][1][2]:
+        action = "hold_invoice"
+    if action is None and ledger and ceilings:
+        if ceilings[0][1][0] != currency:
+            return None
+        action = "settle_invoice" if amount <= ceilings[0][1][1] else "request_approval"
+    if action is None:
+        return None
+
+    role_ref = {"invoice": invoice[0] if invoice else None, "order": order[0] if order else None,
+                "ledger": ledger[0] if ledger else None, "bank": banks[0][0] if banks else None,
+                "ceiling": ceilings[0][0] if ceilings else None, "controls": controls[0] if len(controls) == 1 else None}
+    required = {"reject_duplicate": ("invoice", "ledger", "controls"),
+                "open_exception": ("invoice", "order", "controls"),
+                "hold_invoice": ("invoice", "bank", "controls"),
+                "settle_invoice": ("invoice", "ledger", "ceiling"),
+                "request_approval": ("invoice", "ledger", "ceiling")}[action]
+    evidence = []
+    for kind in required:
+        ref = role_ref[kind] or (role_ref["order"] if kind == "invoice" else None)
+        if not ref or ref in evidence:
+            return None
+        evidence.append(ref)
+    facts = {"vendorName": vendor, "invoiceNumber": invoice_id,
+             "amountMinor": amount, "currency": currency}
+    missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
+    rationale = (f"Action {action} follows current order {current_order} and the unique current records for "
+                 f"{amount} minor units of {currency}. "
+                 + " ".join(f"{ref} supplies the required {kind} relationship."
+                            for kind, ref in zip(required, evidence))
+                 + " Archived, hypothetical and unrelated records were excluded.")
+    if missing:
+        rationale += " Missing source fields remain explicit: " + ", ".join(missing) + "."
+    return {"action": action, "facts": facts, "evidenceRefs": evidence,
+            "rationale": rationale, "unresolvedFacts": missing}
+
+
 def decide(pkg):
     """Read action, facts and the exact three evidence refs. Deterministic on
     the real corpus; a layout-deviating package degrades to heuristics rather
     than to a model."""
-    distributed = distributed_decision(pkg)
+    distributed = distributed_decision(pkg) or semantic_distributed_decision(pkg)
     if distributed is not None:
         return distributed
     paragraph = decisive_paragraph(pkg)
@@ -1337,7 +1493,7 @@ async def cancel_task(task_id: str, request: Request):
 # --------------------------------------------------------------------------- #
 @router.get("/debug/q10/wire")
 async def q10_wire_index(request: Request):
-    if request.query_params.get("key") != _Q10_WIRE_KEY:
+    if not _Q10_WIRE_KEY or request.query_params.get("key") != _Q10_WIRE_KEY:
         return JSONResponse({"error": "forbidden"}, status_code=403)
     try:
         limit = max(1, min(int(request.query_params.get("limit", "25") or "25"), 100))
@@ -1367,7 +1523,7 @@ async def q10_wire_index(request: Request):
 
 @router.get("/debug/q10/wire/{row_id}")
 async def q10_wire_detail(row_id: int, request: Request):
-    if request.query_params.get("key") != _Q10_WIRE_KEY:
+    if not _Q10_WIRE_KEY or request.query_params.get("key") != _Q10_WIRE_KEY:
         return JSONResponse({"error": "forbidden"}, status_code=403)
     with _db_lock:
         row = db().execute(

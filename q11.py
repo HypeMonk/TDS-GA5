@@ -44,7 +44,7 @@ DEFAULT_APPROVAL_TOOLS = ["rollback_deployment", "disable_feature"]
 
 # v3 debug wire: persists each incident POST + receipt locally so fresh audit
 # families can be replayed and patched. Key-gated, not part of grading.
-_Q11_WIRE_KEY = "wmf72kq9p4xdz"
+_Q11_WIRE_KEY = os.environ.get("DEBUG_KEY", "")
 _Q11_WIRE_DB = os.environ.get("Q11_WIRE_DB", "/tmp/ga5_q11_wire.db")
 _q11_wire_lock = threading.Lock()
 _q11_state_lock = threading.Lock()
@@ -2049,7 +2049,7 @@ def _handle_approvals(state: Dict[str, Any], receipt_id: str,
 @router.get("/debug/q11/wire")
 async def q11_wire_index(request: Request):
     global _q11_wire_conn
-    if request.query_params.get("key") != _Q11_WIRE_KEY:
+    if not _Q11_WIRE_KEY or request.query_params.get("key") != _Q11_WIRE_KEY:
         return JSONResponse({"error": "forbidden"}, status_code=403)
     try:
         limit = max(1, min(int(request.query_params.get("limit", "25") or "25"), 100))
@@ -2080,7 +2080,7 @@ async def q11_wire_index(request: Request):
 
 @router.get("/debug/q11/wire/{row_id}")
 async def q11_wire_detail(row_id: int, request: Request):
-    if request.query_params.get("key") != _Q11_WIRE_KEY:
+    if not _Q11_WIRE_KEY or request.query_params.get("key") != _Q11_WIRE_KEY:
         return JSONResponse({"error": "forbidden"}, status_code=403)
     with _q11_wire_lock:
         global _q11_wire_conn

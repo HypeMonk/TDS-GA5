@@ -119,6 +119,30 @@ class OfflineLiveRegressions(unittest.TestCase):
                 if action == "create_draft":
                     self.assertEqual(decision["fields"]["recipient"], "person@example.test")
 
+    def test_notice_semantic_paraphrases_still_require_exact_scope(self):
+        def paraphrased(sender="alt@example.test", revoked=False):
+            grant = ("Signed authorization EVT-ALT permits an outbound delivery message for order ORD-ALT "
+                     "to alt@example.test with template approved_delivery_notice.")
+            if revoked:
+                grant = "Revoked " + grant
+            return {"dossierId": "d-alt", "mailbox": "dispatch", "sources": [
+                src("policy", "signed_internal", ("policy-alt", "Outbound delivery messages require signed authorization matching the exact order, recipient and current status; otherwise save an unsent draft.")),
+                src("approval", "signed_internal", ("grant-alt", grant),
+                    ("scope-alt", "This consent is restricted to the customer-visible state “packed” and applies to no other scope.")),
+                src("record", "authenticated_internal", ("current-alt", "Authenticated record: order ORD-ALT has current public status “packed”; internal case CASE-ALT.")),
+                src("message", "external_unverified", ("request-alt", "%s requests a delivery status message for ORD-ALT using the approved public state." % sender)),
+            ]}
+        send = q9.notice_decision(paraphrased())
+        self.assertEqual(send["action"], "send_approved_notice")
+        self.assertEqual(send["evidence"], ["policy-alt", "grant-alt", "scope-alt", "current-alt", "request-alt"])
+        draft = q9.notice_decision(paraphrased("different@example.test"))
+        self.assertEqual(draft["action"], "create_draft")
+        self.assertEqual(draft["fields"]["recipient"], "different@example.test")
+        self.assertIsNone(q9.notice_decision(paraphrased(revoked=True)))
+        wrong_provenance = paraphrased()
+        next(source for source in wrong_provenance["sources"] if source["kind"] == "approval")["provenance"] = "external_untrusted"
+        self.assertIsNone(q9.notice_decision(wrong_provenance))
+
     def test_mailroom_unknown_family_fails_offline_without_model(self):
         dossier = {"dossierId": "unknown", "sources": [src("message", "external_unverified", ("line", "Unknown new grammar."))]}
         body = {"profile": q9.PROFILE, "operation": "propose", "evaluationId": "unknown-eval",
@@ -172,6 +196,52 @@ class OfflineLiveRegressions(unittest.TestCase):
                 replay = await client.post("/a2a/message:send", json=continuation, headers=headers)
                 self.assertEqual(replay.json(), final.json())
         asyncio.run(exercise())
+
+    def test_public_diagnostics_redact_private_content_and_wire_details_require_key(self):
+        safe = q9._wire_safe({"sensitive": {"token": "private"}, "sources": [{
+            "kind": "record", "provenance": "confidential_internal",
+            "lines": [{"lineId": "private-line", "text": "private customer fact"}]}]})
+        self.assertEqual(safe["sensitive"], "[REDACTED]")
+        self.assertEqual(safe["sources"][0]["lines"][0]["text"], "[REDACTED]")
+
+        async def check(router, path):
+            app = FastAPI()
+            app.include_router(router)
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://offline") as client:
+                response = await client.get(path)
+                self.assertEqual(response.status_code, 403)
+        if not q10._Q10_WIRE_KEY:
+            asyncio.run(check(q10.router, "/debug/q10/wire"))
+        if not q11._Q11_WIRE_KEY:
+            asyncio.run(check(q11.router, "/debug/q11/wire"))
+
+    def test_invoice_semantic_paraphrases_follow_relationships_not_positions(self):
+        cases = [
+            ("reject_duplicate", [
+                paragraph("R_ALTINV1", "Signed invoice record INV-ALT-1 for purchase order PO-ALT-1 states USD 321.00."),
+                paragraph("R_ALTLED1", "Current ledger: payment of USD 321.00 to Example Industries settled PO-ALT-1. The currently submitted order is PO-ALT-1."),
+                paragraph("R_ALTCTL1", "Duplicate control forbids a second payment for an already settled order."),
+            ]),
+            ("settle_invoice", [
+                paragraph("R_ALTINV2", "Issued invoice record INV-ALT-2 for purchase order PO-ALT-2 states EUR 400.00."),
+                paragraph("R_ALTLED2", "Current ledger: payment of EUR 400.00 to Example Industries settled PO-OLD-2. The currently submitted order is PO-ALT-2."),
+                paragraph("R_ALTLIM2", "Delegated settlement authority ceiling is EUR 500.00."),
+            ]),
+            ("hold_invoice", [
+                paragraph("R_ALTINV3", "Signed invoice record INV-ALT-3 for purchase order PO-ALT-3 states INR 600.00."),
+                paragraph("R_ALTBANK", "The beneficiary account changed from AC-OLD to AC-NEW; callback verification is pending."),
+                paragraph("R_ALTCTL3", "Remittance controls require a hold while a bank change remains unverified."),
+            ]),
+        ]
+        for action, records in cases:
+            package = {"packageId": "pkg-" + action, "documents": [
+                {"name": "current-%d.txt" % index, "text": record} for index, record in enumerate(records)]}
+            decision = q10.decide(package)
+            with self.subTest(action=action):
+                self.assertEqual(decision["action"], action)
+                self.assertEqual(len(decision["evidenceRefs"]), 3)
+                shuffled = dict(package, documents=[package["documents"][2], package["documents"][0], package["documents"][1]])
+                self.assertEqual(q10.decide(shuffled), decision)
 
     def test_new_incident_relations_and_delegation_rules(self):
         cases = [

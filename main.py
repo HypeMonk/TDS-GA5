@@ -38,7 +38,59 @@ LOGS_Q3 = deque(maxlen=200)
 LOGS_Q8 = deque(maxlen=200)
 LOGS_Q9 = deque(maxlen=200)
 LOGS_Q10 = deque(maxlen=200)
+
 LOGS_Q11 = deque(maxlen=200)
+
+_DEBUG_SECRET_KEYS = {"authorization", "cookie", "setcookie", "apikey", "accesstoken",
+                      "password", "secret", "sensitive", "token", "privatekey"}
+_DEBUG_SECRET_PATTERN = re.compile(
+    r"(?i)Bearer\s+[^\s\"'<>]+|postgres(?:ql)?://[^\s\"'<>]+|\bsk-[a-z0-9_-]{8,}")
+
+
+def _debug_safe(value):
+    if isinstance(value, dict):
+        private = value.get("provenance") in ("confidential_internal", "private_internal")
+        result = {}
+        for key, item in value.items():
+            normalized = re.sub(r"[^a-z]", "", str(key).lower())
+            if normalized in _DEBUG_SECRET_KEYS:
+                result[key] = "[REDACTED]"
+            elif private and key in ("text", "lines", "content"):
+                if isinstance(item, list):
+                    result[key] = [dict(line, text="[REDACTED]") if isinstance(line, dict) else "[REDACTED]" for line in item]
+                else:
+                    result[key] = "[REDACTED]"
+            else:
+                result[key] = _debug_safe(item)
+        return result
+    if isinstance(value, list):
+        return [_debug_safe(item) for item in value]
+    if isinstance(value, str):
+        return _DEBUG_SECRET_PATTERN.sub("[REDACTED]", value)
+    return value
+
+
+def _safe_debug_entry(entry):
+    result = dict(entry)
+    headers = result.get("headers")
+    if isinstance(headers, dict):
+        result["headers"] = {key: ("[REDACTED]" if key.lower() in ("authorization", "cookie", "x-api-key") else value)
+                             for key, value in headers.items()}
+    if isinstance(result.get("url"), str):
+        parts = urllib.parse.urlsplit(result["url"])
+        query = [(key, "[REDACTED]" if key.lower() in ("key", "token", "api_key") else value)
+                 for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)]
+        result["url"] = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path,
+                                                  urllib.parse.urlencode(query), parts.fragment))
+    for field in ("body", "response_body"):
+        raw = result.get(field)
+        if not isinstance(raw, str) or not raw:
+            continue
+        try:
+            result[field] = json.dumps(_debug_safe(json.loads(raw)), ensure_ascii=False)
+        except (ValueError, TypeError):
+            result[field] = _DEBUG_SECRET_PATTERN.sub("[REDACTED]", raw)
+    return result
 
 # ==============================================================================
 # Middleware for Request Logging and Route-Based Log Partitioning
@@ -155,33 +207,33 @@ async def log_requests(request: Request, call_next):
 def get_all_debug_logs():
     all_logs = list(LOGS_MAIN) + list(LOGS_Q3) + list(LOGS_Q8) + list(LOGS_Q9) + list(LOGS_Q10) + list(LOGS_Q11)
     all_logs.sort(key=lambda x: x["timestamp"])
-    return all_logs
+    return [_safe_debug_entry(entry) for entry in all_logs]
 
 @app.get("/debug/logs/main")
 def get_main_debug_logs():
-    return list(LOGS_MAIN)
+    return [_safe_debug_entry(entry) for entry in LOGS_MAIN]
 
 @app.get("/debug/logs/q3")
 def get_q3_debug_logs():
-    return list(LOGS_Q3)
+    return [_safe_debug_entry(entry) for entry in LOGS_Q3]
 
 @app.get("/debug/logs/q8")
 def get_q8_debug_logs():
-    return list(LOGS_Q8)
+    return [_safe_debug_entry(entry) for entry in LOGS_Q8]
 
 @app.get("/debug/logs/q9")
 def get_q9_debug_logs():
-    return list(LOGS_Q9)
+    return [_safe_debug_entry(entry) for entry in LOGS_Q9]
 
 @app.get("/debug/q10")
 @app.get("/debug/logs/q10")
 def get_q10_debug_logs():
-    return list(LOGS_Q10)
+    return [_safe_debug_entry(entry) for entry in LOGS_Q10]
 
 @app.get("/debug/q11")
 @app.get("/debug/logs/q11")
 def get_q11_debug_logs():
-    return list(LOGS_Q11)
+    return [_safe_debug_entry(entry) for entry in LOGS_Q11]
 
 # ==============================================================================
 # Helper functions & Startup Config

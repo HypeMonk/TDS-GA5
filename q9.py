@@ -604,7 +604,7 @@ def _find(lines, rx):
             return ln["lineId"], m
     return None, None
 
-def notice_decision(dossier):
+def _exact_notice_decision(dossier):
     """Bind a unique signed notice grant to authenticated state and the live request."""
     grants = []
     for _src, lines in _sources(dossier, "approval", "signed_internal"):
@@ -678,6 +678,140 @@ def notice_decision(dossier):
     if any(clean_scalar(value, "") != value for value in fields.values()):
         return None
     return {"action": "send_approved_notice", "evidence": evidence, "fields": fields}
+
+
+_NOTICE_NEGATION = re.compile(r"\b(?:not|never|no longer|revoked|expired|withdrawn|does not|do not|unrelated)\b", re.I)
+_ORDER_TOKEN = re.compile(r"\bORD-[A-Z0-9]+\b")
+_EMAIL_TOKEN = re.compile(r"\b[^\s,:;<>]+@[^\s,:;<>]+\b")
+_TEMPLATE_TOKEN = re.compile(r"\b[a-z][a-z0-9_]*notice\b|\bapproved_delivery_notice\b", re.I)
+_QUOTED_VALUE = re.compile(r"[“\"]([^”\"]+)[”\"]")
+
+
+def _semantic_grant(text):
+    low = text.lower()
+    if (_NOTICE_NEGATION.search(text) or not re.search(r"\b(?:approv\w*|authori[sz]\w*|permit\w*|grant\w*|consent)\b", low)
+            or not re.search(r"\b(?:send|outbound|notice|message|update)\b", low)):
+        return None
+    orders, recipients, templates = _ORDER_TOKEN.findall(text), _EMAIL_TOKEN.findall(text), _TEMPLATE_TOKEN.findall(text)
+    if len(set(orders)) != 1 or len(set(recipients)) != 1 or len(set(t.lower() for t in templates)) != 1:
+        return None
+    return orders[0], recipients[0], templates[0].lower()
+
+
+def _semantic_status(text):
+    low = text.lower()
+    values = _QUOTED_VALUE.findall(text)
+    if (_NOTICE_NEGATION.search(text) or len(values) != 1
+            or not re.search(r"\b(?:approval|permission|consent|grant|authori[sz]ation)\b", low)
+            or not re.search(r"\b(?:status|state)\b", low)
+            or not re.search(r"\b(?:exact|only|restricted|limited|names?|applies)\b", low)):
+        return None
+    return values[0]
+
+
+def _semantic_current(text):
+    low = text.lower()
+    orders, values = _ORDER_TOKEN.findall(text), _QUOTED_VALUE.findall(text)
+    if len(set(orders)) != 1 or len(values) != 1 or not re.search(r"\bcurrent\w*\b", low) or not re.search(r"\b(?:status|state)\b", low):
+        return None
+    cases = re.findall(r"\bCASE-[A-Z0-9]+\b", text)
+    return orders[0], values[0], cases[0] if len(set(cases)) == 1 else ""
+
+
+def _semantic_request(text):
+    low = text.lower()
+    if _NOTICE_NEGATION.search(text) or not re.search(r"\b(?:request\w*|please|asks?|process)\b", low) or not re.search(r"\b(?:notice|status|update|message)\b", low):
+        return None
+    orders, senders = _ORDER_TOKEN.findall(text), _EMAIL_TOKEN.findall(text)
+    if len(set(orders)) != 1 or len(set(senders)) != 1:
+        return None
+    return senders[0], orders[0]
+
+
+def _semantic_notice_policy(text):
+    low = text.lower()
+    return (re.search(r"\b(?:send|outbound|notice|message)\b", low)
+            and re.search(r"\b(?:approval|authorization|consent|grant)\b", low)
+            and re.search(r"\b(?:exact|match\w*|same)\b", low)
+            and re.search(r"\b(?:draft|unsent|do not send|not transmit)\b", low))
+
+
+def _semantic_notice_decision(dossier):
+    grants, statuses = [], []
+    for _src, lines in _sources(dossier, "approval", "signed_internal"):
+        for line in lines:
+            text, lid = line.get("text") or "", line["lineId"]
+            if text.startswith("Archival annotation:") or re.search(r"\b(?:unrelated|another customer|other customer)\b", text, re.I):
+                continue
+            grant, status = _semantic_grant(text), _semantic_status(text)
+            if grant:
+                grants.append((lid, grant))
+            if status:
+                statuses.append((lid, status))
+            if not grant and not status and (_ORDER_TOKEN.search(text) or _EMAIL_TOKEN.search(text)):
+                return None
+    if len(grants) != 1 or len(statuses) != 1:
+        return None
+    grant_id, (reference, recipient, template) = grants[0]
+    status_id, approved_status = statuses[0]
+
+    current = []
+    for kind in ("record", "history"):
+        for _src, lines in _sources(dossier, kind, "authenticated_internal"):
+            for line in lines:
+                text = line.get("text") or ""
+                if text.startswith("Archival annotation:"):
+                    continue
+                parsed = _semantic_current(text)
+                if parsed:
+                    current.append((line["lineId"], parsed))
+                elif reference in text:
+                    return None
+    matching = [(lid, facts) for lid, facts in current if facts[0] == reference]
+    if len(matching) != 1 or len({facts for _lid, facts in matching}) != 1:
+        return None
+    current_id, (current_reference, current_status, _case) = matching[0]
+
+    requests = []
+    for _src, lines in _sources(dossier, "message", "external_unverified"):
+        for line in lines:
+            text = line.get("text") or ""
+            if text.startswith("Archival annotation:") or re.search(r"\b(?:unrelated|earlier order|not (?:the )?current case)\b", text, re.I):
+                continue
+            parsed = _semantic_request(text)
+            if parsed:
+                requests.append((line["lineId"], parsed))
+            elif _ORDER_TOKEN.search(text) or _EMAIL_TOKEN.search(text):
+                return None
+    if len(requests) > 1:
+        return None
+    policy = next((line["lineId"] for _src, lines in _sources(dossier, "policy", "signed_internal")
+                   for line in lines if _semantic_notice_policy(line.get("text") or "")), None)
+    covered = (reference == current_reference and approved_status == current_status
+               and template == "approved_delivery_notice")
+    evidence = [grant_id, status_id]
+    if requests:
+        request_id, (sender, requested_reference) = requests[0]
+        if not policy or requested_reference != current_reference:
+            return None
+        covered = covered and recipient == sender
+        evidence = [policy, grant_id, status_id, current_id, request_id]
+    if not covered:
+        if not requests or not policy:
+            return None
+        fields = {"recipient": sender, "referenceId": current_reference, "status": current_status}
+        if any(clean_scalar(value, "") != value for value in fields.values()):
+            return None
+        return {"action": "create_draft", "evidence": evidence, "fields": fields, "raw_order": True}
+    fields = {"recipient": recipient, "referenceId": reference, "status": approved_status}
+    if any(clean_scalar(value, "") != value for value in fields.values()):
+        return None
+    return {"action": "send_approved_notice", "evidence": evidence, "fields": fields, "raw_order": bool(requests)}
+
+
+def notice_decision(dossier):
+    """Exact known contracts first, then a provenance-bound semantic parser."""
+    return _exact_notice_decision(dossier) or _semantic_notice_decision(dossier)
 
 
 def deterministic_decision(dossier):
@@ -1288,6 +1422,31 @@ handle_mailroom_actions = mailroom
 
 # ------------------------------------------------------------------ forensics
 
+_WIRE_SECRET_KEYS = {"authorization", "apikey", "accesstoken", "password", "secret", "sensitive", "token"}
+
+
+def _wire_safe(value):
+    if isinstance(value, dict):
+        private = value.get("provenance") in ("confidential_internal", "private_internal")
+        result = {}
+        for key, item in value.items():
+            normalized = re.sub(r"[^a-z]", "", str(key).lower())
+            if normalized in _WIRE_SECRET_KEYS:
+                result[key] = "[REDACTED]"
+            elif private and key in ("text", "lines", "content"):
+                if isinstance(item, list):
+                    result[key] = [dict(line, text="[REDACTED]") if isinstance(line, dict) else "[REDACTED]" for line in item]
+                else:
+                    result[key] = "[REDACTED]"
+            else:
+                result[key] = _wire_safe(item)
+        return result
+    if isinstance(value, list):
+        return [_wire_safe(item) for item in value]
+    if isinstance(value, str) and looks_secret(value):
+        return "[REDACTED]"
+    return value
+
 @router.get("/debug/q9")
 @router.get("/debug/q9/wire")
 async def debug_q9_wire(limit: int = 12, eval_id: str = "", full: int = 0):
@@ -1324,8 +1483,8 @@ async def debug_q9_wire(limit: int = 12, eval_id: str = "", full: int = 0):
             "evaluationId": eid,
             "received": received,
             "decidedBy": rec.get("decidedBy", {}),
-            "proposals": rec.get("proposals", []),
-            "request": rec.get("request"),
+            "proposals": _wire_safe(rec.get("proposals", [])),
+            "request": _wire_safe(rec.get("request")),
         })
     return {"evals": out}
 
