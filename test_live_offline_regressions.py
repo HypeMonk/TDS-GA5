@@ -158,8 +158,8 @@ class OfflineLiveRegressions(unittest.TestCase):
     def test_distributed_invoice_records_are_order_independent(self):
         expected = {
             "duplicate": ("reject_duplicate", "INV-TEST-1", "Example Supplier", []),
-            "settle_missing_invoice": ("settle_invoice", "unknown", "Example Supplier", ["invoiceNumber"]),
-            "exception": ("open_exception", "INV-TEST-3", "unknown", ["vendorName"]),
+            "settle_missing_invoice": ("settle_invoice", "PO-TEST-2", "Example Supplier", []),
+            "exception": ("open_exception", "INV-TEST-3", "AC-333", []),
         }
         for case, values in expected.items():
             pkg = package(case)

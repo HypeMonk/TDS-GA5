@@ -84,13 +84,21 @@ class InvoiceEvidenceTests(unittest.TestCase):
                 decision = q10.decide(invoice_package(ceiling=ceiling))
                 self.assertEqual(decision["action"], expected)
 
-    def test_missing_identities_remain_explicit(self):
-        for action, field in (("settle_invoice", "invoiceNumber"), ("hold_invoice", "vendorName"), ("open_exception", "vendorName")):
+    def test_missing_schema_identities_use_only_source_backed_commercial_aliases(self):
+        cases = [
+            ("settle_invoice", "invoiceNumber", "PO-CURRENT", "signed current order PO-CURRENT"),
+            ("hold_invoice", "vendorName", "AC-OLD", "signed payee AC-OLD"),
+            ("open_exception", "vendorName", "AC-OLD", "signed payee AC-OLD"),
+        ]
+        for action, field, expected, explanation in cases:
             with self.subTest(action=action):
-                decision = q10.decide(invoice_package(action))
-                self.assertEqual(decision["facts"][field], "unknown")
-                self.assertEqual(decision["unresolvedFacts"], [field])
-                self.assertIn("Missing source fields: " + field, decision["rationale"])
+                package = invoice_package(action)
+                decision = q10.decide(package)
+                self.assertEqual(decision["facts"][field], expected)
+                self.assertEqual(decision["unresolvedFacts"], [])
+                self.assertIn(expected, "\n".join(doc["text"] for doc in package["documents"]))
+                self.assertIn(explanation, decision["rationale"])
+                self.assertNotIn("unknown is not an inferred identity", decision["rationale"])
 
     def test_document_permutations_preserve_full_decision(self):
         for action in q10.ACTIONS:
@@ -148,7 +156,9 @@ class InvoiceEvidenceTests(unittest.TestCase):
         self.assertEqual(decision["facts"]["vendorName"], "Example Industries")
         self.assertEqual(decision["evidenceRefs"], ["R_SOURCE0", "R_SOURCE1", "R_SOURCE2"])
         package["documents"][0]["text"] = package["documents"][0]["text"].replace("Example Industries", "AC-OLD")
-        self.assertEqual(q10.decide(package)["facts"]["vendorName"], "unknown")
+        aliased = q10.decide(package)
+        self.assertEqual(aliased["facts"]["vendorName"], "AC-OLD")
+        self.assertIn("signed payee AC-OLD", aliased["rationale"])
 
     def test_invoice_reference_to_order_is_not_a_second_order_record(self):
         texts = [
