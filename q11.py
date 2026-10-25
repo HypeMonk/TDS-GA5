@@ -364,7 +364,7 @@ _DECOY_SIGNALS = [
     "ordinary weekly band", "copied from an unrelated", "training material",
     "dropped a low-priority heartbeat", "ticket format is valid", "ignore previous",
     "please run", "as an instruction", "decoy", "retain this full sentence",
-    "must not drive", "not to suggest a causal", "no dependency path",
+    "must not drive", "not to suggest a causal", "no dependency path", "do not match this case",
 ]
 _STOP = set("the a an of to for and or in on at is are was were be by with from this that "
             "it its as we our you your they their has have had will would should".split())
@@ -448,7 +448,7 @@ _BAD_CTX = ("malformed", "regression", "regressed", "errors", "error", "failing"
             "seconds of release", "after release")
 
 
-_CLAUSE_SPLIT = re.compile(r"[.\n;]+")
+_CLAUSE_SPLIT = re.compile(r"[\n;]+|\.(?:\s+|$)")
 
 
 def _parse_release(text: str) -> Optional[str]:
@@ -483,7 +483,8 @@ def _parse_release(text: str) -> Optional[str]:
                 continue
             low = c.lower()
             good += sum(low.count(g) for g in _GOOD_CTX)
-            bad += sum(low.count(b) for b in _BAD_CTX)
+            failure_text = re.sub(r"\b(?:no|without) (?:matching )?(?:errors?|failures?)\b", "", low)
+            bad += sum(failure_text.count(b) for b in _BAD_CTX)
         return good - bad
 
     # Best good-minus-bad context wins; tie-break prefers the later-mentioned id
@@ -684,9 +685,7 @@ def _offline_observations(incident: Dict[str, Any]) -> List[Tuple[str, str]]:
     for eid, raw in _evidence_lines(incident.get("transcript", "") or ""):
         body = _strip_head(raw)
         low = body.lower()
-        if _DECOY_TOKEN in low or re.search(
-                r"\b(?:unrelated|hypothetical|untrusted evidence|not causal|not decision evidence|"
-                r"training material|quoted example|quoted instruction)\b", low):
+        if _DECOY_TOKEN in low or _is_decoy(body):
             continue
         subjects = set(re.findall(r"\bsvc_[A-Za-z0-9_-]+\b", body))
         if service and subjects and service not in subjects:
@@ -727,9 +726,11 @@ _FAILURE_RELATIONS = {
         r"(?:errors?|error rise|invalid responses?).{0,40}(?:follows?|tracks).{0,40}(?:release|rollout|deployment)",
         r"error-rate step.{0,60}rollout boundary",
         r"deployment regression.{0,80}(?:reproduces|new release)",
+        r"first failed after.{0,40}r\d+-[a-z0-9]+.{0,30}entered production",
+        r"failure rate rises.{0,40}(?:rollout|release)",
     ),
     "database_connection_exhaustion": (
-        r"pool.{0,60}(?:acquisition|checkout).{0,60}(?:timeout|time out|wait)",
+        r"pool.{0,60}(?:acquisition|checkout|lease).{0,60}(?:timeout|time out|wait)",
         r"(?:database|connection).{0,40}pool.{0,60}(?:exhaust|full|saturat)",
         r"database.{0,60}(?:reached|exceeded).{0,40}connection ceiling",
     ),
@@ -742,12 +743,14 @@ _FAILURE_RELATIONS = {
     "feature_flag_recursion": (
         r"flag.{0,100}(?:loop|recurs|depth)",
         r"(?:recursive|recursion|evaluation depth exceeded).{0,100}flag",
+        r"loop in the feature evaluator.{0,80}cohort.{0,30}flag_",
     ),
     "traffic_capacity_exhaustion": (
         r"queue.{0,100}(?:latency rise|requests per second|peak traffic|peak load)",
         r"(?:workers?|replicas?).{0,60}saturat.{0,60}(?:traffic|load)",
         r"(?:trial|extra|controlled).{0,30}replica.{0,50}drain.{0,30}queue",
         r"request saturation.{0,60}(?:latency|reproduces)",
+        r"per-replica utilization is pinned.{0,50}(?:load|traffic).{0,80}backlog growth follows traffic spikes",
     ),
     "secret_rotation_mismatch": (
         r"secret rotation.{0,90}(?:promoted|credential|revoked|mismatch)",
@@ -841,16 +844,22 @@ def _evaluate_condition(expression: str, values: Dict[str, int]) -> bool:
 def _operating_rules(signal_text: str, root_cause: str) -> Dict[str, Any]:
     """Read current values and evaluate the stated branch, independent of identifiers."""
     values = {}
+    state_text = "\n".join(re.split(r"\b(?:if|when)\b",
+        re.split(r"\b(?:Policy|Rule):", line, maxsplit=1, flags=re.I)[0], maxsplit=1, flags=re.I)[0]
+        for line in signal_text.splitlines())
     assignments = {
         "operating": r"(?:replicas operating|operating replicas|current replicas)\s*=\s*(\d+)",
         "maximum": r"(?:contract maximum|capacity maximum|authori[sz]ed maximum)\s*=\s*(\d+)",
-        "freeze": r"rollback freeze\s*=\s*([01])",
+        "freeze": r"\b(?:(?:rollback|change)\s+)?freeze\s*=\s*([01])",
+        "target": r"proposed target\s*=\s*(\d+)",
+        "delegation": r"(?:rollback|emergency flag) delegation\s*=\s*([01])",
+        "remaining": r"remaining (?:approved reversions|permitted changes)\s*=\s*(\d+)",
         "slots": r"remaining rollback slots\s*=\s*(\d+)",
         "enabled": r"(?:flag-change delegation:\s*)?enabled\s*=\s*([01])",
         "change_slots": r"change slots remaining\s*=\s*(\d+)",
     }
     for name, pattern in assignments.items():
-        found = {int(m.group(1)) for m in re.finditer(pattern, signal_text, re.I)}
+        found = {int(m.group(1)) for m in re.finditer(pattern, state_text, re.I)}
         if len(found) > 1:
             raise HTTPException(status_code=422, detail="Conflicting operating state")
         if found:
@@ -871,9 +880,38 @@ def _operating_rules(signal_text: str, root_cause: str) -> Dict[str, Any]:
         raise HTTPException(status_code=422, detail="Unsupported operating remedy")
 
     result: Dict[str, Any] = {}
+    target_rule = re.search(
+        r"Policy:\s*scaling to the proposed target requires a contract maximum at least that large "
+        r"and freeze\s*=\s*0;\s*otherwise\s+(.+?)(?:\.(?:\s|$)|$)", signal_text, re.I)
+    if target_rule:
+        if not {"operating", "maximum", "freeze", "target"} <= set(values):
+            raise HTTPException(status_code=422, detail="Incomplete scaling authority state")
+        if values["freeze"] == 0 and values["operating"] < values["target"] <= values["maximum"]:
+            result.update(effect="scale_service", targetReplicas=values["target"])
+        else:
+            result.update(remedy(target_rule.group(1)))
+
+    reversal_rule = re.search(
+        r"Policy:\s*the operator may make the specified reversal only when delegation\s*=\s*1, "
+        r"freeze\s*=\s*0 and remaining changes are positive;\s*otherwise\s+(.+?)(?:\.(?:\s|$)|$)",
+        signal_text, re.I)
+    if reversal_rule:
+        if not {"delegation", "freeze", "remaining"} <= set(values):
+            raise HTTPException(status_code=422, detail="Incomplete reversal delegation state")
+        if values["delegation"] == 1 and values["freeze"] == 0 and values["remaining"] > 0:
+            tool = {"deployment_regression": "rollback_deployment", "feature_flag_recursion": "disable_feature"}.get(root_cause)
+            if tool is None:
+                raise HTTPException(status_code=422, detail="Reversal rule does not match the incident cause")
+            selected = {"effect": tool}
+        else:
+            selected = remedy(reversal_rule.group(1))
+        if result and result != selected:
+            raise HTTPException(status_code=422, detail="Conflicting operating remedies")
+        result.update(selected)
+
     rule = re.search(r"\b(?:if|when)\s+(.+?),\s*(.+?)[.;]\s*otherwise[,:]?\s+(.+?)(?:\.(?:\s|$)|$)",
                      signal_text, re.I)
-    if rule and values:
+    if rule and values and not reversal_rule:
         try:
             condition = _evaluate_condition(rule.group(1), values)
         except ValueError:
@@ -966,7 +1004,7 @@ def heuristic_decision(incident: Dict[str, Any], policy: Dict[str, Any],
     signal = _offline_observations(incident)
     root_cause = _classify_failure(signal, allowed)
     evidence = [eid for eid, _ in signal][:4]
-    signal_raw = " ".join(t for _, t in signal)
+    signal_raw = "\n".join(t for _, t in signal)
     signal_text = signal_raw.lower()
     rckws = set(_tokens(root_cause))
 

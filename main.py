@@ -173,10 +173,12 @@ def get_q8_debug_logs():
 def get_q9_debug_logs():
     return list(LOGS_Q9)
 
+@app.get("/debug/q10")
 @app.get("/debug/logs/q10")
 def get_q10_debug_logs():
     return list(LOGS_Q10)
 
+@app.get("/debug/q11")
 @app.get("/debug/logs/q11")
 def get_q11_debug_logs():
     return list(LOGS_Q11)
@@ -268,7 +270,12 @@ def startup_event():
 @app.options("/")
 def read_root():
     email = os.environ.get("STUDENT_EMAIL") or os.environ.get("EMAIL") or "Not configured"
-    return {"status": "ok", "message": "GA-5 Universal Monolith is running!", "email": email}
+    return {"status": "ok", "version": "offline-v13", "message": "GA-5 Universal Monolith is running!", "email": email}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": "offline-v13"}
 
 # ==============================================================================
 # Q2 - Spec-Driven Development: The Proration Bug

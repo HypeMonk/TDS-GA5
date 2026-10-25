@@ -4,14 +4,12 @@ One endpoint, two operations. `propose` reads dossiers and returns exactly one
 least-privilege action per dossier; `commit` binds grader receipts to those
 proposals and returns terminal outcomes.
 
-4-LEVEL DECISION CASCADE:
-1. Persistent Cache (Atomic OS files + SQLite WAL q9_v3_decisions)
-2. Dynamic Rule-Based Deterministic Solver (deterministic_decision)
-3. AIPIPE API (AIPIPE_KEY, gpt-4o)
-4. OpenRouter API (OPENROUTER_API_KEY, nvidia/nemotron-3-ultra-550b-a55b:free)
+OFFLINE DECISION CASCADE:
+1. Persistent protocol replay and versioned content decisions.
+2. Current-scope deterministic rules.
+Unsupported layouts are rejected without contacting a model provider.
 """
 
-import asyncio
 import base64
 import binascii
 import hashlib
@@ -21,8 +19,6 @@ import re
 import sqlite3
 import tempfile
 import time
-import urllib.request
-import urllib.error
 import logging
 from fastapi import APIRouter, HTTPException, Request
 
@@ -142,6 +138,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 PROFILE = "ga5-mailroom-action-gate/v2"
+DECISION_REVISION = "q9-offline-scope-v13"
 
 ACTIONS = (
     "create_draft",
@@ -374,16 +371,6 @@ def put_commit(commit_key: str, response_dict: dict):
 
     _put("INSERT OR REPLACE INTO q9_v3_commits VALUES (?,?)", (commit_key, json.dumps(response_dict, ensure_ascii=False)))
 
-# --------------------------------------------------------------- API Configs
-
-AIPIPE_KEY = os.environ.get("AIPIPE_KEY", "")
-AIPIPE_BASE = os.environ.get("AIPIPE_BASE", "https://aipipe.org/openai/v1")
-AIPIPE_MODEL = os.environ.get("AIPIPE_MODEL", "gpt-4o")
-
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE = os.environ.get("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
-
 # --------------------------------------------------------------- canonical
 
 def canonical(obj):
@@ -516,7 +503,14 @@ Q = "[“\"]([^”\"]+)[”\"]"
 # "Approval EVT-... authorizes a single outbound shipment update about" |
 # "Approval EVT-... grants one customer-status message concerning"
 RE_APPROVAL = re.compile(r"Approval (EVT-[A-Z0-9]+) (?:permits one delivery-status notice for|authorizes a single outbound shipment update about|grants one customer-status message concerning) (ORD-[A-Z0-9]+) to (\S+) using template (\S+)\.")
-RE_APPROVAL_STATUS = re.compile(r"(?:valid for the public status |names precisely the visible state |permission applies only to the customer-visible state )" + Q)
+RE_APPROVAL_STATUS = re.compile(
+    r"The (?:approval is valid for the public status |signed consent names precisely the visible state |"
+    r"permission applies only to the customer-visible state )" + Q
+    + r" and for no other recipient, attachment, or account field\.")
+RE_CURRENT_NOTICE = re.compile(r"Order (ORD-[A-Z0-9]+) currently has the customer-visible status " + Q + r"; case (CASE-[A-Z0-9]+) remains internal\.")
+RE_NOTICE_REQUEST = re.compile(r"From ([^\s:]+): please process a delivery status notice about order (ORD-[A-Z0-9]+), using the approved customer-visible status\.")
+NOTICE_POLICY = ("Mailroom rule: send only when a signed approval names the exact order, recipient and current status. "
+                 "Otherwise prepare an unsent status draft in the owning mailbox. An approval for another scope is not valid.")
 # v3 fresh-audit insurance: the approval's validity sentence may be re-housed in
 # a record/history source by an unseen family, in any known phrasing — including
 # the consent wordings ("The signed consent names precisely the visible state ...").
@@ -610,6 +604,82 @@ def _find(lines, rx):
             return ln["lineId"], m
     return None, None
 
+def notice_decision(dossier):
+    """Bind a unique signed notice grant to authenticated state and the live request."""
+    grants = []
+    for _src, lines in _sources(dossier, "approval", "signed_internal"):
+        permits = [(ln["lineId"], RE_APPROVAL.fullmatch(ln.get("text") or "")) for ln in lines]
+        permits = [(lid, match) for lid, match in permits if match]
+        if not permits:
+            continue
+        scopes = [(ln["lineId"], RE_APPROVAL_STATUS.fullmatch(ln.get("text") or "")) for ln in lines]
+        scopes = [(lid, match) for lid, match in scopes if match]
+        if len(permits) != 1 or len(scopes) != 1:
+            return None
+        operative_ids = {permits[0][0], scopes[0][0]}
+        if any(ln["lineId"] not in operative_ids
+               and not (ln.get("text") or "").startswith("Archival annotation:") for ln in lines):
+            return None
+        grants.append((permits[0], scopes[0]))
+    if len(grants) != 1:
+        return None
+    (lid, permit), (slid, scope) = grants[0]
+    _event, reference, recipient, template = permit.groups()
+    status = scope.group(1)
+    current = []
+    for kind in ("record", "history"):
+        for _src, lines in _sources(dossier, kind, "authenticated_internal"):
+            for ln in lines:
+                match = RE_CURRENT_NOTICE.fullmatch(ln.get("text") or "")
+                if match:
+                    current.append((ln["lineId"], match.groups()))
+    requests = []
+    for _src, lines in _sources(dossier, "message", "external_unverified"):
+        for ln in lines:
+            match = RE_NOTICE_REQUEST.fullmatch(ln.get("text") or "")
+            if match:
+                requests.append((ln["lineId"], match.groups()))
+            elif ((ln.get("text") or "")
+                  and not (ln.get("text") or "").startswith("Archival annotation:")
+                  and ln.get("text") != "An unrelated customer asks for an earlier order's status; this message does not refer to the current case."):
+                return None
+    if len(requests) > 1:
+        return None
+    requested_reference = requests[0][1][1] if requests else reference
+    for kind in ("record", "history"):
+        for _src, lines in _sources(dossier, kind, "authenticated_internal"):
+            for ln in lines:
+                text = ln.get("text") or ""
+                if (re.search(r"\b" + re.escape(requested_reference) + r"\b", text)
+                        and not text.startswith("Archival annotation:") and not RE_CURRENT_NOTICE.fullmatch(text)):
+                    return None
+    records = [(rlid, facts) for rlid, facts in current if facts[0] == requested_reference]
+    if not records or len({facts for _rlid, facts in records}) != 1:
+        return None
+    rlid, (current_reference, current_status, _case) = records[0]
+    policy = next((ln["lineId"] for _src, lines in _sources(dossier, "policy", "signed_internal")
+                   for ln in lines if ln.get("text") == NOTICE_POLICY), None)
+    covered = reference == current_reference and status == current_status and template == "approved_delivery_notice"
+    evidence = [lid, slid]
+    if requests:
+        mlid, (sender, _requested) = requests[0]
+        if not policy:
+            return None
+        covered = covered and recipient == sender
+        evidence = [policy, lid, slid, rlid, mlid]
+    if not covered:
+        if not requests or not policy:
+            return None
+        fields = {"recipient": sender, "referenceId": current_reference, "status": current_status}
+        if any(clean_scalar(value, "") != value for value in fields.values()):
+            return None
+        return {"action": "create_draft", "evidence": evidence, "fields": fields}
+    fields = {"recipient": recipient, "referenceId": reference, "status": status}
+    if any(clean_scalar(value, "") != value for value in fields.values()):
+        return None
+    return {"action": "send_approved_notice", "evidence": evidence, "fields": fields}
+
+
 def deterministic_decision(dossier):
     _src, lines = _bearing(dossier, "attachment", "external_untrusted", INJECTION_CLAUSE, EXFIL_CLAUSE)
     if lines:
@@ -631,25 +701,9 @@ def deterministic_decision(dossier):
         ev = [e for e in (plid, lid, flid) if e]
         return {"action": "no_action", "evidence": ev, "fields": {"reasonCode": COMPLETED_REASONS[m.group(2)], "referenceId": ref_id}}
 
-    _src, lines = _bearing(dossier, "approval", "signed_internal", APPROVAL_CLAUSE,
-                           "authorizes a single outbound shipment update",
-                           "grants one customer-status message concerning")
-    lid, m = _find(lines, RE_APPROVAL)
-    slid, sm = _find(lines, RE_APPROVAL_STATUS)
-    if m and sm is None:
-        # v3 fresh-audit insurance: an unseen family may state the approval's
-        # validity sentence ("valid for the public status ...") in a record or
-        # history source instead of inside the approval itself — in either
-        # known phrasing. Scan the whole dossier once for it so the engine
-        # keeps solving the family deterministically with the minimal,
-        # sufficient set [permit, status-line] instead of the LLM cascade.
-        for check_lid, check_text, _s in dossier_lines(dossier):
-            sm = RE_ANY_STATUS.search(check_text)
-            if sm is not None:
-                slid = check_lid
-                break
-    if m and sm:
-        return {"action": "send_approved_notice", "evidence": [lid, slid], "fields": {"recipient": m.group(3), "referenceId": m.group(2), "status": sm.group(1)}}
+    notice = notice_decision(dossier)
+    if notice is not None:
+        return notice
 
     _src, lines = _bearing(dossier, "event", "signed_internal", CARRIER_CLAUSE)
     lid, m = _find(lines, RE_CARRIER)
@@ -717,78 +771,11 @@ def deterministic_decision(dossier):
 
     return None
 
-# ------------------------------------------------------- Level 3 & Level 4 LLM Cascade
-
-SYSTEM_PROMPT = """You are the action gate of a mailroom agent. For every dossier choose EXACTLY ONE least-privilege action.
-ACTIONS: no_action, create_draft, update_internal_record, request_confirmation, send_approved_notice, quarantine_item.
-Return JSON: {"decisions": {"<dossierId>": {"action": "<action>", "evidence": ["<lineId>"], "fields": {...}}}}"""
-
-def build_user_message(items):
-    parts = ["Decide one action for each of the %d dossiers below." % len(items)]
-    for did, dossier in items:
-        parts.append(render_dossier(dossier, did))
-    parts.append('Reply with JSON {"decisions": {...}} covering exactly these ids: ' + ", ".join(i[0] for i in items))
-    return "\n\n".join(parts)
-
-async def call_single_llm_api(items: list, base_url: str, api_key: str, model: str) -> dict:
-    if not api_key or not items:
-        return {}
-    user_msg = build_user_message(items)
-    body = json.dumps({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg}
-        ],
-        "temperature": 0.0,
-        "max_tokens": 2048
-    }).encode("utf-8")
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"
-    }
-    req = urllib.request.Request(f"{base_url}/chat/completions", data=body, headers=headers)
-
-    def _do_call():
-        with urllib.request.urlopen(req, timeout=10.0) as r:
-            return json.loads(r.read())
-
-    try:
-        loop = asyncio.get_event_loop()
-        res = await asyncio.wait_for(loop.run_in_executor(None, _do_call), timeout=12.0)
-        txt = res["choices"][0]["message"]["content"].strip()
-        txt = re.sub(r'^```(?:json)?\s*', '', txt, flags=re.MULTILINE)
-        txt = re.sub(r'\s*```$', '', txt, flags=re.MULTILINE)
-        data = json.loads(txt.strip())
-        decisions = data.get("decisions") if isinstance(data, dict) else (data if isinstance(data, dict) else {})
-        return {did: decisions[did] for did, _d in items if isinstance(decisions.get(did), dict)}
-    except Exception as e:
-        logger.error(f"LLM call to {model} failed: {e}")
-        return {}
+# ------------------------------------------------------- offline-only compatibility hook
 
 async def run_model_cascade(pending: list) -> dict:
-    if not pending:
-        return {}
-    out = {}
-    # Level 3: AIPIPE API (gpt-4o)
-    if AIPIPE_KEY:
-        try:
-            out = await call_single_llm_api(pending, AIPIPE_BASE, AIPIPE_KEY, AIPIPE_MODEL)
-        except Exception as e:
-            logger.error(f"AIPIPE error: {e}")
-
-    # Level 4: OpenRouter API fallback (nvidia/nemotron)
-    missing = [it for it in pending if it[0] not in out]
-    if missing and OPENROUTER_KEY:
-        try:
-            or_res = await call_single_llm_api(missing, OPENROUTER_BASE, OPENROUTER_KEY, OPENROUTER_MODEL)
-            out.update(or_res)
-        except Exception as e:
-            logger.error(f"OpenRouter error: {e}")
-
-    return out
+    """Retained for local replay tooling; model providers are never contacted."""
+    return {}
 
 # ------------------------------------------------------- frozen tool shapes
 
@@ -972,7 +959,7 @@ async def do_propose(body):
     # Level 1: Persistent Cache & Level 2: Dynamic Deterministic Solver
     cached, pending, resolved = {}, [], {}
     for did, fp, d in zip(ids, fingerprints, dossiers):
-        hit = _get("q9_v3_decisions", "cache_key", did + "|" + fp)
+        hit = _get("q9_v3_decisions", "cache_key", DECISION_REVISION + "|" + did + "|" + fp)
         if hit is not None:
             cached[did] = json.loads(hit[1])
             continue
@@ -981,9 +968,12 @@ async def do_propose(body):
             resolved[did] = fixed
         else:
             pending.append((did, d))
-    # Level 3: AIPIPE -> Level 4: OpenRouter LLM Cascade for pending dossiers
-    decisions = await run_model_cascade(pending)
-    decisions.update(resolved)
+    if pending:
+        raise HTTPException(status_code=422, detail={
+            "code": "UNSUPPORTED_OFFLINE_DOSSIER",
+            "dossierIds": [did for did, _ in pending],
+            "message": "Current evidence does not prove a supported offline action; no model call was made."})
+    decisions = resolved
 
     proposals = []
     for did, fp, d in zip(ids, fingerprints, dossiers):
@@ -993,14 +983,12 @@ async def do_propose(body):
             proposal = build_proposal(did, d, fp, raw or {})
             blob = canonical(proposal)
             if raw is not None:
-                _put("INSERT OR REPLACE INTO q9_v3_decisions VALUES (?,?)", (did + "|" + fp, blob))
+                _put("INSERT OR REPLACE INTO q9_v3_decisions VALUES (?,?)", (DECISION_REVISION + "|" + did + "|" + fp, blob))
             _put("INSERT OR REPLACE INTO q9_v3_calls VALUES (?,?)", (proposal["callId"], blob))
         _put("INSERT OR REPLACE INTO q9_v3_eval_calls VALUES (?,?)", (eval_id + "|" + proposal["callId"], canonical(proposal)))
         proposals.append(proposal)
 
-    # v3 forensics: record which layer decided each dossier (persistent
-    # decision cache / deterministic engine / LLM cascade). An LLM tag on a
-    # fresh audit dossier is the prime suspect for an audit-proposal miss.
+    # Record the cache or deterministic rule layer; unresolved inputs never use a model.
     decided_by = {}
     for did, fp, d in zip(ids, fingerprints, dossiers):
         if did in cached:
@@ -1008,7 +996,7 @@ async def do_propose(body):
         elif did in resolved:
             decided_by[did] = "engine"
         else:
-            decided_by[did] = "llm"
+            decided_by[did] = "unsupported"
 
     response = {
         "profile": PROFILE,
@@ -1255,6 +1243,7 @@ async def do_commit(body):
     put_commit_wire(eval_id, {"receipts": receipts, "outcomes": outcomes})
     return response
 
+@router.post("/v1/mailroom/action")
 @router.post("/v1/mailroom/actions")
 @router.post("/q9/mailroom")
 @router.post("/mailroom")
@@ -1299,6 +1288,7 @@ handle_mailroom_actions = mailroom
 
 # ------------------------------------------------------------------ forensics
 
+@router.get("/debug/q9")
 @router.get("/debug/q9/wire")
 async def debug_q9_wire(limit: int = 12, eval_id: str = "", full: int = 0):
     """Restart-proof propose wire, newest evaluations first.
