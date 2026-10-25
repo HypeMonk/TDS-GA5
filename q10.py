@@ -791,46 +791,6 @@ _AUDIT_NOISE = {
 _AUDIT_ARCHIVE = re.compile(r"^(?:Archived supplier memo|Archive examples|Historical bank transfer|A previous quarter|Operations discussed .+?training case|A closed reconciliation incident for a separate supplier)", re.I)
 
 
-def _relationship_rationale(action, facts, current_order, evidence, details):
-    """Explain each controlling reference once and connect it to the action."""
-    first, second, third = evidence
-    identity = (f"invoice {facts['invoiceNumber']} from {facts['vendorName']} for "
-                f"{facts['amountMinor']} minor units of {facts['currency']}")
-    if action == "reject_duplicate":
-        return (f"Action reject_duplicate: {first} identifies the current {identity} on order {current_order}. "
-                f"{second} records a prior disbursement settling that same order, not merely a matching amount. "
-                f"{third} prohibits a second payment for an already discharged commercial order.")
-    if action == "open_exception":
-        if details.get("identityMissing"):
-            if details.get("thirdRole") == "ceiling":
-                return (f"Action open_exception: {first} identifies signed current order {current_order} and payable "
-                        f"{facts['amountMinor']} minor units of {facts['currency']} but supplies no distinct invoice number. "
-                        f"{second} names vendor {facts['vendorName']}, binds the ledger to current order {current_order}, "
-                        "and applies the control requiring exception handling for material order/invoice uncertainty. "
-                        f"{third} states an authority ceiling, but financial authority cannot cure the missing invoice identity.")
-            return (f"Action open_exception: {first} identifies signed current order {current_order} and payable "
-                    f"{facts['amountMinor']} minor units of {facts['currency']} but supplies no distinct invoice number. "
-                    f"{second} names vendor {facts['vendorName']} and binds the ledger to current order {current_order}; "
-                    "without an invoice identity, exact duplicate and reconciliation checks cannot complete. "
-                    f"{third} requires the exception workflow for material order/invoice uncertainty.")
-        return (f"Action open_exception: {first} identifies the current {identity}. "
-                f"{second} shows the signed order total {details.get('orderMinor')} differs from the submitted "
-                f"invoice total {facts['amountMinor']}. {third} requires the exception workflow for a material "
-                "order/invoice conflict with no corrected instrument.")
-    if action == "hold_invoice":
-        return (f"Action hold_invoice: {first} identifies the current {identity}. "
-                f"{second} shows remittance changed from {details.get('oldAccount')} to {details.get('newAccount')} "
-                "and the independent callback is still pending. "
-                f"{third} requires payment to remain paused until that verification closes.")
-    comparison = "within" if action == "settle_invoice" else "above"
-    consequence = "permits autonomous settlement" if action == "settle_invoice" else "requires a named approver"
-    return (f"Action {action}: {first} identifies signed current order {current_order} and payable {identity}. "
-            f"{second} names the vendor and shows the recorded payment settled different order "
-            f"{details.get('paidOrder')}, so it is not a duplicate of {current_order}. "
-            f"{third} confirms the established remittance channel and an autonomous ceiling of "
-            f"{details.get('limitMinor')} minor units; {facts['amountMinor']} is {comparison} that ceiling, which {consequence}.")
-
-
 def distributed_decision(pkg):
     """Join current invoice/order/ledger/control records instead of their file positions."""
     if cover_facts(pkg) is not None:
@@ -867,15 +827,13 @@ def distributed_decision(pkg):
     amount = _money_minor(signed[4] if signed else order[4], currency)
     if amount is None or (order and order[0] != current_order) or (ledger and ledger[4] != current_order):
         return None
-    facts = {"vendorName": ledger[2] if ledger else "unknown",
-             "invoiceNumber": signed[0] if signed else current_order,
+    facts = {"vendorName": ledger[2] if ledger else "unknown", "invoiceNumber": signed[0] if signed else current_order,
              "amountMinor": amount, "currency": currency}
-    identity_incomplete = signed is None
     disagreement = bool(signed and signed[5])
     if order:
         disagreement |= order[1] != currency or _money_minor(order[2], order[1]) != amount
         disagreement |= order[3] != currency or _money_minor(order[4], order[3]) != amount
-    if identity_incomplete or disagreement:
+    if disagreement:
         action = "open_exception"
     elif ledger and ledger[3] == current_order:
         if ledger[0] != currency or _money_minor(ledger[1], ledger[0]) != amount:
@@ -891,32 +849,21 @@ def distributed_decision(pkg):
         action = "settle_invoice" if amount <= limit else "request_approval"
     else:
         return None
-    role_ref = {key: refs.get(key) for key in ("signed", "order", "ledger", "bank", "ceiling", "controls")}
-    incomplete_exception_roles = (("order", "ledger", "ceiling")
-                                  if identity_incomplete and refs.get("controls") == refs.get("ledger") and refs.get("ceiling")
-                                  else ("order", "ledger", "controls"))
-    required = {"reject_duplicate": ("signed", "ledger", "controls"),
-                "open_exception": (incomplete_exception_roles if identity_incomplete else ("signed", "order", "controls")),
-                "hold_invoice": ("signed", "bank", "controls"),
-                "settle_invoice": ("order", "ledger", "ceiling"),
-                "request_approval": ("order", "ledger", "ceiling")}[action]
-    evidence = [role_ref[kind] for kind in required]
-    if any(not ref for ref in evidence) or len(set(evidence)) != 3:
+    evidence = []
+    for key in ("signed", "order", "ledger", "bank", "ceiling", "controls"):
+        if key in refs and refs[key] not in evidence:
+            evidence.append(refs[key])
+    if len(evidence) != 3:
         return None
-    limit_minor = (_money_minor(components["ceiling"][2], components["ceiling"][1])
-                   if "ceiling" in components else None)
-    order_minor = (_money_minor(order[2], order[1]) if order else None)
-    details = {"paidOrder": ledger[3] if ledger else None, "limitMinor": limit_minor,
-               "orderMinor": order_minor, "identityMissing": identity_incomplete,
-               "thirdRole": required[2], "controlsInSecond": refs.get("controls") == refs.get("ledger"),
-               "oldAccount": components.get("bank", (None, None))[0],
-               "newAccount": components.get("bank", (None, None))[1]}
     missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
-    rationale = _relationship_rationale(action, facts, current_order, evidence, details)
+    rationale = (f"Action {action} follows current order {current_order} for {amount} minor units of {currency}. "
+                 + " ".join(f"{refs[kind]} supplies the current {kind} record."
+                            for kind in ("signed", "order", "ledger", "bank", "ceiling", "controls") if kind in refs)
+                 + " Commercial identity, payment history and the stated controls govern this decision; archived records do not.")
     if signed is None:
         rationale += f" No distinct invoice number is supplied; {current_order} is the signed current commercial identifier."
     if missing:
-        rationale += " Missing from the supplied records: " + ", ".join(missing) + "."
+        rationale += " Missing from the supplied records: " + ", ".join(missing) + "; 'unknown' is an explicit unresolved marker."
     return {"action": action, "facts": facts, "evidenceRefs": evidence, "rationale": rationale,
             "unresolvedFacts": missing}
 
@@ -940,8 +887,7 @@ def _semantic_invoice_record(text):
     if (len(set(invoices)) != 1 or len(set(orders)) != 1 or len(amounts) != 1
             or not re.search(r"\b(?:signed|commercial instrument|issued invoice|invoice record)\b", text, re.I)):
         return None
-    payee = re.search(r"\b(?:payee|beneficiary|vendor account)\s+(?:is\s+)?([^,;.]+)", text, re.I)
-    return invoices[0].upper(), orders[0].upper(), amounts[0], payee.group(1).strip() if payee else "unknown"
+    return invoices[0].upper(), orders[0].upper(), amounts[0]
 
 
 def _semantic_order_record(text):
@@ -969,7 +915,7 @@ def _semantic_bank_record(text):
     if not re.search(r"\b(?:bank|account|remittance|beneficiary|callback)\b", text, re.I):
         return None
     accounts = re.findall(r"\bAC-[A-Z0-9-]+\b", text, re.I)
-    if not accounts and not re.search(r"\bcallback\b", text, re.I):
+    if not accounts and not re.search(r"callback", text, re.I):
         return None
     pending = bool(re.search(r"\b(?:pending|awaiting|not yet|unverified)\b", text, re.I))
     confirmed = bool(re.search(r"\b(?:confirmed|verified|established channel|completed)\b", text, re.I))
@@ -1025,15 +971,14 @@ def semantic_distributed_decision(pkg):
         return None
     current_order = invoice[1][1] if invoice else order[1][0]
     currency, amount = invoice[1][2] if invoice else order[1][1][0]
-    identity_incomplete = invoice is None
     if order:
         order_amounts = set(order[1][1])
-        if identity_incomplete or order[1][0] != current_order or len(order_amounts) != 1 or (currency, amount) not in order_amounts:
+        if order[1][0] != current_order or len(order_amounts) != 1 or (currency, amount) not in order_amounts:
             action = "open_exception"
         else:
             action = None
     else:
-        action = "open_exception" if identity_incomplete else None
+        action = None
     if ledger and ledger[1][3] != current_order:
         return None
     vendor = ledger[1][1] if ledger else "unknown"
@@ -1054,11 +999,8 @@ def semantic_distributed_decision(pkg):
     role_ref = {"invoice": invoice[0] if invoice else None, "order": order[0] if order else None,
                 "ledger": ledger[0] if ledger else None, "bank": banks[0][0] if banks else None,
                 "ceiling": ceilings[0][0] if ceilings else None, "controls": controls[0] if len(controls) == 1 else None}
-    incomplete_exception_roles = (("order", "ledger", "ceiling")
-                                  if identity_incomplete and role_ref.get("controls") == role_ref.get("ledger") and role_ref.get("ceiling")
-                                  else ("order", "ledger", "controls"))
     required = {"reject_duplicate": ("invoice", "ledger", "controls"),
-                "open_exception": (incomplete_exception_roles if identity_incomplete else ("invoice", "order", "controls")),
+                "open_exception": ("invoice", "order", "controls"),
                 "hold_invoice": ("invoice", "bank", "controls"),
                 "settle_invoice": ("invoice", "ledger", "ceiling"),
                 "request_approval": ("invoice", "ledger", "ceiling")}[action]
@@ -1071,13 +1013,11 @@ def semantic_distributed_decision(pkg):
     facts = {"vendorName": vendor, "invoiceNumber": invoice_id if invoice_id != "unknown" else current_order,
              "amountMinor": amount, "currency": currency}
     missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
-    details = {"paidOrder": ledger[1][2] if ledger else None,
-               "limitMinor": ceilings[0][1][1] if ceilings else None,
-               "orderMinor": order[1][1][0][1] if order and order[1][1] else None,
-               "identityMissing": identity_incomplete, "thirdRole": required[2],
-               "controlsInSecond": role_ref.get("controls") == role_ref.get("ledger"),
-               "oldAccount": "the established account", "newAccount": "the proposed account"}
-    rationale = _relationship_rationale(action, facts, current_order, evidence, details)
+    rationale = (f"Action {action} follows current order {current_order} and the unique current records for "
+                 f"{amount} minor units of {currency}. "
+                 + " ".join(f"{ref} supplies the required {kind} relationship."
+                            for kind, ref in zip(required, evidence))
+                 + " Archived, hypothetical and unrelated records were excluded.")
     if invoice is None:
         rationale += f" No distinct invoice number is supplied; {current_order} is the signed current commercial identifier."
     if missing:

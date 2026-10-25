@@ -322,12 +322,12 @@ def startup_event():
 @app.options("/")
 def read_root():
     email = os.environ.get("STUDENT_EMAIL") or os.environ.get("EMAIL") or "Not configured"
-    return {"status": "ok", "version": "offline-v17", "message": "GA-5 Universal Monolith is running!", "email": email}
+    return {"status": "ok", "version": "offline-v18", "message": "GA-5 Universal Monolith is running!", "email": email}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "offline-v17"}
+    return {"status": "ok", "version": "offline-v18"}
 
 # ==============================================================================
 # Q2 - Spec-Driven Development: The Proration Bug
