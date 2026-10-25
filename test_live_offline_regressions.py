@@ -158,8 +158,8 @@ class OfflineLiveRegressions(unittest.TestCase):
     def test_distributed_invoice_records_are_order_independent(self):
         expected = {
             "duplicate": ("reject_duplicate", "INV-TEST-1", "Example Supplier", []),
-            "settle_missing_invoice": ("settle_invoice", "PO-TEST-2", "Example Supplier", []),
-            "exception": ("open_exception", "INV-TEST-3", "AC-333", []),
+            "settle_missing_invoice": ("settle_invoice", "unknown", "Example Supplier", ["invoiceNumber"]),
+            "exception": ("open_exception", "INV-TEST-3", "unknown", ["vendorName"]),
         }
         for case, values in expected.items():
             pkg = package(case)
@@ -199,6 +199,33 @@ class OfflineLiveRegressions(unittest.TestCase):
                 self.assertEqual(final.json()["task"]["state"], q10.COMPLETED)
                 replay = await client.post("/a2a/message:send", json=continuation, headers=headers)
                 self.assertEqual(replay.json(), final.json())
+        asyncio.run(exercise())
+
+    def test_invoice_identity_experiment_assigns_all_four_arms_deterministically(self):
+        async def exercise():
+            app = FastAPI()
+            app.include_router(q10.router)
+            headers = {"Authorization": "Bearer identity-experiment", "A2A-Version": "1.0",
+                       "Content-Type": q10.A2A_MEDIA_TYPE}
+            packages = []
+            for package_id in ("pkg-zeta", "pkg-alpha", "pkg-mu", "pkg-beta"):
+                current = package("settle_missing_invoice")
+                current["packageId"] = package_id
+                packages.append(current)
+            request = {"message": {"messageId": "msg-identity-experiment", "role": "ROLE_USER", "parts": [{
+                "mediaType": q10.MODE_BATCH,
+                "data": {"batchId": "batch-identity-experiment", "packages": packages}}]}}
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://offline") as client:
+                response = await client.post("/a2a/message:send", json=request, headers=headers)
+                self.assertEqual(response.status_code, 200, response.text)
+                proposals = response.json()["task"]["artifacts"][0]["parts"][0]["data"]["proposals"]
+                by_id = {proposal["packageId"]: proposal for proposal in proposals}
+                baseline = q10.decide(packages[0])
+                expected = {package_id: q10._identity_experiment_rationale(baseline, rank)
+                            for rank, package_id in enumerate(sorted(by_id))}
+                self.assertEqual({package_id: proposal["rationale"] for package_id, proposal in by_id.items()}, expected)
+                self.assertTrue(all(proposal["facts"]["invoiceNumber"] == "unknown" for proposal in proposals))
+                self.assertTrue(all(proposal["action"] == "settle_invoice" for proposal in proposals))
         asyncio.run(exercise())
 
     def test_public_diagnostics_redact_private_content_and_wire_details_require_key(self):

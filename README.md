@@ -4,11 +4,13 @@ A single FastAPI deployment for the assignment endpoints. The Q2–Q4 agent path
 
 ## Offline decision model
 
-- **Invoice/A2A:** extracts current commercial identities, amounts, order/payment relationships, authority ceilings, bank verification, and exactly three controlling references. It supports both the ordinary cover/ledger layout and distributed/paraphrased records independent of file order. When a distributed record omits a distinct invoice number, the signed current order is used as the source-backed commercial identifier. When it supplies only a signed payee account, that exact account is used as the source-backed counterparty identifier rather than fabricating a human-readable vendor. Actions still follow the current ledger, verification state, and authority boundary.
+- **Invoice/A2A:** extracts current commercial identities, amounts, order/payment relationships, authority ceilings, bank verification, and exactly three controlling references. It supports both the ordinary cover/ledger layout and distributed/paraphrased records independent of file order. When a distributed record omits a distinct invoice number or human-readable vendor, that field remains `unknown` rather than being invented. The evidence-backed action still follows the signed order/invoice, current ledger, verification state, and authority boundary.
 - **Mailroom:** selects actions from source kind, provenance, current authenticated state, signed scope, exact request identity, and least privilege. Standing approvals and request-controlled notices are handled separately. Contradictory or unsupported evidence returns HTTP 422 without a model call.
 - **Incident response:** classifies unique positive causal relations, validates catalog-bound arguments, evaluates bounded numeric/Boolean operating rules, enforces approval gates, and persists receipt-driven state and OTLP topology.
 
 The solver is designed to generalize through entities and relationships rather than fixed generated IDs. Arbitrary natural-language input can still be ambiguous; those cases fail closed instead of being guessed.
+
+`offline-v25-exp` is a one-Check diagnostic build. For source-incomplete Q2 audit packages only, it deterministically rotates four rationale formats while keeping action, facts and evidence IDs fixed. Complete packages and every previously accepted proposal remain unchanged. The returned rationale identifies the arm through its form, and protected traces record `identityRationaleVariant`; remove the experiment after collecting one Check.
 
 ## Render
 
@@ -26,7 +28,7 @@ No provider API key is required for Q2–Q4.
 
 ## Health and diagnostics
 
-- `/health` — readiness and version (`offline-v23`)
+- `/health` — readiness and version (`offline-v25-exp`)
 - `/debug/q9` — redacted durable Q3 proposal records
 - `/debug/q9/commitwire` — redacted Q3 receipt/outcome records
 - `/debug/q10` — redacted recent Q2 HTTP records

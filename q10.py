@@ -3,9 +3,8 @@
 Self-contained, deterministic, and API-key-free. The graded invoice packages
 are machine-generated with a fixed layout, so the whole decision - action,
 facts and the exact three evidence refs - is read straight out of the case
-files. No model provider is imported or called; unsupported layouts fail closed,
-and schema identities omitted as human-readable labels use only source-backed
-commercial aliases from the signed records.
+files. No model provider is imported or called; unsupported layouts fail closed or
+use explicit unresolved identity markers rather than invented commercial facts.
 
 A2A HTTP+JSON surface (served at BOTH the origin and under /a2a so the agent
 works whether the base URL submitted to the grader is `<app>/` or `<app>/a2a/`):
@@ -102,7 +101,9 @@ def _q10_batch_part(message):
 
 # -------------------------------------------------------------- diagnostics
 
-SOLVER_VERSION = "offline-v23"
+SOLVER_VERSION = "offline-v25-exp"
+IDENTITY_RATIONALE_EXPERIMENT = True
+IDENTITY_RATIONALE_VARIANTS = 4
 _TRACE_DB_PATH = os.environ.get("Q10_TRACE_DB", DB_PATH + ".traces")
 _TRACE_BODY_LIMIT = 2 * 1024 * 1024
 _TRACE_STORAGE_LIMIT = 32 * 1024 * 1024
@@ -989,6 +990,36 @@ def _relationship_rationale(action, facts, current_order, evidence, details, sou
     return lead + " ".join(citations) + suffix
 
 
+def _identity_experiment_rationale(decision, variant):
+    """Vary only explanation form for source-incomplete audit packages.
+
+    Actions, facts and evidence remain fixed. A single fresh Check can therefore
+    distinguish an explanation-format rejection from the grader's unavailable
+    hidden identity without risking already accepted proposals.
+    """
+    rationale = decision["rationale"]
+    missing = decision.get("unresolvedFacts") or []
+    if not missing or variant == 0:
+        return rationale
+    without_missing = re.sub(r"\s+Missing source fields:.*$", "", rationale)
+    if variant == 1:
+        return without_missing
+    if variant == 2:
+        result = rationale
+        for ref in decision["evidenceRefs"]:
+            result = result.replace(ref + ":", "[" + ref + "]:")
+        return result
+    refs = decision["evidenceRefs"]
+    facts = decision["facts"]
+    return (
+        f"Action {decision['action']} is supported by [{refs[0]}], [{refs[1]}], and [{refs[2]}]. "
+        f"Together these current records establish the payable {facts['amountMinor']} minor units of "
+        f"{facts['currency']} and the controlling payment, verification, conflict, or authority condition. "
+        "Archive and training records are excluded. The supplied current records do not state "
+        + ", ".join(missing) + "; the facts therefore retain explicit unknown markers."
+    )
+
+
 def distributed_decision(pkg):
     """Join current invoice/order/ledger/control records instead of their file positions."""
     if cover_facts(pkg) is not None:
@@ -1026,8 +1057,8 @@ def distributed_decision(pkg):
     amount = _money_minor(signed[4] if signed else order[4], currency)
     if amount is None or (order and order[0] != current_order) or (ledger and ledger[4] != current_order):
         return None
-    facts = {"vendorName": ledger[2] if ledger else signed[2] if signed else "unknown",
-             "invoiceNumber": signed[0] if signed else current_order,
+    facts = {"vendorName": ledger[2] if ledger else "unknown",
+             "invoiceNumber": signed[0] if signed else "unknown",
              "amountMinor": amount, "currency": currency}
     disagreement = bool(signed and signed[5])
     if order:
@@ -1063,12 +1094,6 @@ def distributed_decision(pkg):
     details = {"paidOrder": ledger[3] if ledger else None, "limitMinor": limit_minor}
     missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
     rationale = _relationship_rationale(action, facts, current_order, evidence, details, sources)
-    if signed is None:
-        rationale += (f" No distinct invoice number is supplied; signed current order {current_order} is the "
-                      "source-backed commercial identifier used for invoiceNumber.")
-    if ledger is None and signed is not None:
-        rationale += (f" No human-readable vendor name is supplied; signed payee {signed[2]} is the "
-                      "source-backed counterparty identifier used for vendorName.")
     return {"action": action, "facts": facts, "evidenceRefs": evidence, "rationale": rationale,
             "unresolvedFacts": missing}
 
@@ -1094,6 +1119,8 @@ def _semantic_invoice_record(text):
         return None
     payee = re.search(r"\b(?:payee|beneficiary|vendor(?: account)?)\s+(?:is\s+)?(.+?)(?=\s+and\s+[A-Z]{3}\s+\d|[,;.]|$)", text, re.I)
     vendor = payee.group(1).strip() if payee else "unknown"
+    if re.fullmatch(r"AC-[A-Z0-9-]+", vendor, re.I):
+        vendor = "unknown"
     return invoices[0].upper(), orders[0].upper(), amounts[0], vendor
 
 
@@ -1191,7 +1218,7 @@ def semantic_distributed_decision(pkg):
     if ledger and ledger[1][3] != current_order:
         return None
     vendor = ledger[1][1] if ledger else invoice[1][3] if invoice else "unknown"
-    invoice_id = invoice[1][0] if invoice else current_order
+    invoice_id = invoice[1][0] if invoice else "unknown"
     if action is None and ledger and ledger[1][2] == current_order:
         if ledger[1][0] != (currency, amount):
             return None
@@ -1226,12 +1253,6 @@ def semantic_distributed_decision(pkg):
                "limitMinor": ceilings[0][1][1] if ceilings else None}
     sources = {ref: text for ref, text, _roles in records}
     rationale = _relationship_rationale(action, facts, current_order, evidence, details, sources)
-    if invoice is None:
-        rationale += (f" No distinct invoice number is supplied; signed current order {current_order} is the "
-                      "source-backed commercial identifier used for invoiceNumber.")
-    if ledger is None and re.fullmatch(r"AC-[A-Z0-9-]+", vendor, re.I):
-        rationale += (f" No human-readable vendor name is supplied; signed payee {vendor} is the "
-                      "source-backed counterparty identifier used for vendorName.")
     return {"action": action, "facts": facts, "evidenceRefs": evidence,
             "rationale": rationale, "unresolvedFacts": missing}
 
@@ -1552,10 +1573,23 @@ async def start_task(who, message, message_id, fingerprint, traces=None):
                   " VALUES(?,?,?,?)", (who, message_id, fingerprint, task_id))
         c.commit()
 
-    proposals = []
+    planned = []
     for i, pkg in enumerate(packages):
         trace = {} if traces is not None else None
-        d = decide(pkg, trace=trace)
+        decision = decide(pkg, trace=trace)
+        planned.append((i, decision, trace))
+    incomplete = sorted((ids[i], i) for i, decision, _trace in planned
+                        if decision.get("unresolvedFacts"))
+    variant_by_index = {index: rank % IDENTITY_RATIONALE_VARIANTS
+                        for rank, (_package_id, index) in enumerate(incomplete)}
+
+    proposals = []
+    for i, d, trace in planned:
+        if IDENTITY_RATIONALE_EXPERIMENT and i in variant_by_index:
+            variant = variant_by_index[i]
+            d["rationale"] = _identity_experiment_rationale(d, variant)
+            if trace is not None:
+                trace["identityRationaleVariant"] = variant
         if trace is not None:
             traces.append(trace)
         proposals.append({

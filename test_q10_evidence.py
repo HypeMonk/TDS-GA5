@@ -84,21 +84,13 @@ class InvoiceEvidenceTests(unittest.TestCase):
                 decision = q10.decide(invoice_package(ceiling=ceiling))
                 self.assertEqual(decision["action"], expected)
 
-    def test_missing_schema_identities_use_only_source_backed_commercial_aliases(self):
-        cases = [
-            ("settle_invoice", "invoiceNumber", "PO-CURRENT", "signed current order PO-CURRENT"),
-            ("hold_invoice", "vendorName", "AC-OLD", "signed payee AC-OLD"),
-            ("open_exception", "vendorName", "AC-OLD", "signed payee AC-OLD"),
-        ]
-        for action, field, expected, explanation in cases:
+    def test_missing_identities_remain_explicit(self):
+        for action, field in (("settle_invoice", "invoiceNumber"), ("hold_invoice", "vendorName"), ("open_exception", "vendorName")):
             with self.subTest(action=action):
-                package = invoice_package(action)
-                decision = q10.decide(package)
-                self.assertEqual(decision["facts"][field], expected)
-                self.assertEqual(decision["unresolvedFacts"], [])
-                self.assertIn(expected, "\n".join(doc["text"] for doc in package["documents"]))
-                self.assertIn(explanation, decision["rationale"])
-                self.assertNotIn("unknown is not an inferred identity", decision["rationale"])
+                decision = q10.decide(invoice_package(action))
+                self.assertEqual(decision["facts"][field], "unknown")
+                self.assertEqual(decision["unresolvedFacts"], [field])
+                self.assertIn("Missing source fields: " + field, decision["rationale"])
 
     def test_document_permutations_preserve_full_decision(self):
         for action in q10.ACTIONS:
@@ -156,9 +148,7 @@ class InvoiceEvidenceTests(unittest.TestCase):
         self.assertEqual(decision["facts"]["vendorName"], "Example Industries")
         self.assertEqual(decision["evidenceRefs"], ["R_SOURCE0", "R_SOURCE1", "R_SOURCE2"])
         package["documents"][0]["text"] = package["documents"][0]["text"].replace("Example Industries", "AC-OLD")
-        aliased = q10.decide(package)
-        self.assertEqual(aliased["facts"]["vendorName"], "AC-OLD")
-        self.assertIn("signed payee AC-OLD", aliased["rationale"])
+        self.assertEqual(q10.decide(package)["facts"]["vendorName"], "unknown")
 
     def test_invoice_reference_to_order_is_not_a_second_order_record(self):
         texts = [
@@ -174,6 +164,24 @@ class InvoiceEvidenceTests(unittest.TestCase):
         self.assertEqual(decision["action"], "open_exception")
         self.assertEqual(decision["facts"]["amountMinor"], 20000)
         self.assertEqual(decision["evidenceRefs"], ["R_SOURCE0", "R_SOURCE1", "R_SOURCE2"])
+
+    def test_identity_rationale_experiment_changes_only_explanation_form(self):
+        decision = q10.decide(invoice_package("settle_invoice"))
+        baseline = {key: decision[key] for key in ("action", "facts", "evidenceRefs", "unresolvedFacts")}
+        variants = [q10._identity_experiment_rationale(decision, index) for index in range(4)]
+        self.assertEqual(len(set(variants)), 4)
+        for index, rationale in enumerate(variants):
+            with self.subTest(variant=index):
+                self.assertGreaterEqual(len(rationale), 60)
+                self.assertLessEqual(len(rationale), 1500)
+                self.assertIn("Action " + decision["action"], rationale)
+                for reference in decision["evidenceRefs"]:
+                    self.assertEqual(rationale.count(reference), 1)
+                self.assertEqual({key: decision[key] for key in baseline}, baseline)
+        self.assertIn("Missing source fields", variants[0])
+        self.assertNotIn("Missing source fields", variants[1])
+        self.assertIn("[" + decision["evidenceRefs"][0] + "]", variants[2])
+        self.assertTrue(variants[3].startswith("Action settle_invoice is supported by"))
 
     def test_long_excerpts_fit_contract_and_remain_source_prefixes(self):
         refs = [f"R_LONG_{i}" for i in range(3)]
