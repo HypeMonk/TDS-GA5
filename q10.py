@@ -791,6 +791,34 @@ _AUDIT_NOISE = {
 _AUDIT_ARCHIVE = re.compile(r"^(?:Archived supplier memo|Archive examples|Historical bank transfer|A previous quarter|Operations discussed .+?training case|A closed reconciliation incident for a separate supplier)", re.I)
 
 
+def _relationship_rationale(action, facts, current_order, evidence, details):
+    """Explain each controlling reference once and connect it to the action."""
+    first, second, third = evidence
+    identity = (f"invoice {facts['invoiceNumber']} from {facts['vendorName']} for "
+                f"{facts['amountMinor']} minor units of {facts['currency']}")
+    if action == "reject_duplicate":
+        return (f"Action reject_duplicate: {first} identifies the current {identity} on order {current_order}. "
+                f"{second} records a prior disbursement settling that same order, not merely a matching amount. "
+                f"{third} prohibits a second payment for an already discharged commercial order.")
+    if action == "open_exception":
+        return (f"Action open_exception: {first} identifies the current {identity}. "
+                f"{second} shows the signed order total {details.get('orderMinor')} differs from the submitted "
+                f"invoice total {facts['amountMinor']}. {third} requires the exception workflow for a material "
+                "order/invoice conflict with no corrected instrument.")
+    if action == "hold_invoice":
+        return (f"Action hold_invoice: {first} identifies the current {identity}. "
+                f"{second} shows remittance changed from {details.get('oldAccount')} to {details.get('newAccount')} "
+                "and the independent callback is still pending. "
+                f"{third} requires payment to remain paused until that verification closes.")
+    comparison = "within" if action == "settle_invoice" else "above"
+    consequence = "permits autonomous settlement" if action == "settle_invoice" else "requires a named approver"
+    return (f"Action {action}: {first} identifies signed current order {current_order} and payable {identity}. "
+            f"{second} names the vendor and shows the recorded payment settled different order "
+            f"{details.get('paidOrder')}, so it is not a duplicate of {current_order}. "
+            f"{third} confirms the established remittance channel and an autonomous ceiling of "
+            f"{details.get('limitMinor')} minor units; {facts['amountMinor']} is {comparison} that ceiling, which {consequence}.")
+
+
 def distributed_decision(pkg):
     """Join current invoice/order/ledger/control records instead of their file positions."""
     if cover_facts(pkg) is not None:
@@ -827,7 +855,7 @@ def distributed_decision(pkg):
     amount = _money_minor(signed[4] if signed else order[4], currency)
     if amount is None or (order and order[0] != current_order) or (ledger and ledger[4] != current_order):
         return None
-    facts = {"vendorName": ledger[2] if ledger else (signed[2] if signed else "unknown"),
+    facts = {"vendorName": ledger[2] if ledger else "unknown",
              "invoiceNumber": signed[0] if signed else current_order,
              "amountMinor": amount, "currency": currency}
     disagreement = bool(signed and signed[5])
@@ -850,23 +878,27 @@ def distributed_decision(pkg):
         action = "settle_invoice" if amount <= limit else "request_approval"
     else:
         return None
-    evidence = []
-    for key in ("signed", "order", "ledger", "bank", "ceiling", "controls"):
-        if key in refs and refs[key] not in evidence:
-            evidence.append(refs[key])
-    if len(evidence) != 3:
+    role_ref = {key: refs.get(key) for key in ("signed", "order", "ledger", "bank", "ceiling", "controls")}
+    required = {"reject_duplicate": ("signed", "ledger", "controls"),
+                "open_exception": ("signed", "order", "controls"),
+                "hold_invoice": ("signed", "bank", "controls"),
+                "settle_invoice": ("order", "ledger", "ceiling"),
+                "request_approval": ("order", "ledger", "ceiling")}[action]
+    evidence = [role_ref[kind] for kind in required]
+    if any(not ref for ref in evidence) or len(set(evidence)) != 3:
         return None
+    limit_minor = (_money_minor(components["ceiling"][2], components["ceiling"][1])
+                   if "ceiling" in components else None)
+    order_minor = (_money_minor(order[2], order[1]) if order else None)
+    details = {"paidOrder": ledger[3] if ledger else None, "limitMinor": limit_minor,
+               "orderMinor": order_minor, "oldAccount": components.get("bank", (None, None))[0],
+               "newAccount": components.get("bank", (None, None))[1]}
     missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
-    rationale = (f"Action {action} follows current order {current_order} for {amount} minor units of {currency}. "
-                 + " ".join(f"{refs[kind]} supplies the current {kind} record."
-                            for kind in ("signed", "order", "ledger", "bank", "ceiling", "controls") if kind in refs)
-                 + " Commercial identity, payment history and the stated controls govern this decision; archived records do not.")
+    rationale = _relationship_rationale(action, facts, current_order, evidence, details)
     if signed is None:
         rationale += f" No distinct invoice number is supplied; {current_order} is the signed current commercial identifier."
-    if signed is not None and ledger is None:
-        rationale += f" No distinct vendor name is supplied; signed payee {signed[2]} is the current commercial-party identifier."
     if missing:
-        rationale += " Missing from the supplied records: " + ", ".join(missing) + "; 'unknown' is an explicit unresolved marker."
+        rationale += " Missing from the supplied records: " + ", ".join(missing) + "."
     return {"action": action, "facts": facts, "evidenceRefs": evidence, "rationale": rationale,
             "unresolvedFacts": missing}
 
@@ -985,7 +1017,7 @@ def semantic_distributed_decision(pkg):
         action = None
     if ledger and ledger[1][3] != current_order:
         return None
-    vendor = ledger[1][1] if ledger else (invoice[1][3] if invoice else "unknown")
+    vendor = ledger[1][1] if ledger else "unknown"
     invoice_id = invoice[1][0] if invoice else "unknown"
     if action is None and ledger and ledger[1][2] == current_order:
         if ledger[1][0] != (currency, amount):
@@ -1017,15 +1049,13 @@ def semantic_distributed_decision(pkg):
     facts = {"vendorName": vendor, "invoiceNumber": invoice_id if invoice_id != "unknown" else current_order,
              "amountMinor": amount, "currency": currency}
     missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
-    rationale = (f"Action {action} follows current order {current_order} and the unique current records for "
-                 f"{amount} minor units of {currency}. "
-                 + " ".join(f"{ref} supplies the required {kind} relationship."
-                            for kind, ref in zip(required, evidence))
-                 + " Archived, hypothetical and unrelated records were excluded.")
+    details = {"paidOrder": ledger[1][2] if ledger else None,
+               "limitMinor": ceilings[0][1][1] if ceilings else None,
+               "orderMinor": order[1][1][0][1] if order and order[1][1] else None,
+               "oldAccount": "the established account", "newAccount": "the proposed account"}
+    rationale = _relationship_rationale(action, facts, current_order, evidence, details)
     if invoice is None:
         rationale += f" No distinct invoice number is supplied; {current_order} is the signed current commercial identifier."
-    if invoice is not None and ledger is None and vendor != "unknown":
-        rationale += f" No distinct vendor name is supplied; signed payee {vendor} is the current commercial-party identifier."
     if missing:
         rationale += " Missing source fields remain explicit: " + ", ".join(missing) + "."
     return {"action": action, "facts": facts, "evidenceRefs": evidence,
