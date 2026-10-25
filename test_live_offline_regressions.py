@@ -158,7 +158,7 @@ class OfflineLiveRegressions(unittest.TestCase):
         expected = {
             "duplicate": ("reject_duplicate", "INV-TEST-1", "Example Supplier", []),
             "settle_missing_invoice": ("settle_invoice", "PO-TEST-2", "Example Supplier", []),
-            "exception": ("open_exception", "INV-TEST-3", "unknown", ["vendorName"]),
+            "exception": ("open_exception", "INV-TEST-3", "AC-333", []),
         }
         for case, values in expected.items():
             pkg = package(case)

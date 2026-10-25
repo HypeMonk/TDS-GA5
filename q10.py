@@ -827,7 +827,8 @@ def distributed_decision(pkg):
     amount = _money_minor(signed[4] if signed else order[4], currency)
     if amount is None or (order and order[0] != current_order) or (ledger and ledger[4] != current_order):
         return None
-    facts = {"vendorName": ledger[2] if ledger else "unknown", "invoiceNumber": signed[0] if signed else current_order,
+    facts = {"vendorName": ledger[2] if ledger else (signed[2] if signed else "unknown"),
+             "invoiceNumber": signed[0] if signed else current_order,
              "amountMinor": amount, "currency": currency}
     disagreement = bool(signed and signed[5])
     if order:
@@ -862,6 +863,8 @@ def distributed_decision(pkg):
                  + " Commercial identity, payment history and the stated controls govern this decision; archived records do not.")
     if signed is None:
         rationale += f" No distinct invoice number is supplied; {current_order} is the signed current commercial identifier."
+    if signed is not None and ledger is None:
+        rationale += f" No distinct vendor name is supplied; signed payee {signed[2]} is the current commercial-party identifier."
     if missing:
         rationale += " Missing from the supplied records: " + ", ".join(missing) + "; 'unknown' is an explicit unresolved marker."
     return {"action": action, "facts": facts, "evidenceRefs": evidence, "rationale": rationale,
@@ -887,7 +890,8 @@ def _semantic_invoice_record(text):
     if (len(set(invoices)) != 1 or len(set(orders)) != 1 or len(amounts) != 1
             or not re.search(r"\b(?:signed|commercial instrument|issued invoice|invoice record)\b", text, re.I)):
         return None
-    return invoices[0].upper(), orders[0].upper(), amounts[0]
+    payee = re.search(r"\b(?:payee|beneficiary|vendor account)\s+(?:is\s+)?([^,;.]+)", text, re.I)
+    return invoices[0].upper(), orders[0].upper(), amounts[0], payee.group(1).strip() if payee else "unknown"
 
 
 def _semantic_order_record(text):
@@ -915,7 +919,7 @@ def _semantic_bank_record(text):
     if not re.search(r"\b(?:bank|account|remittance|beneficiary|callback)\b", text, re.I):
         return None
     accounts = re.findall(r"\bAC-[A-Z0-9-]+\b", text, re.I)
-    if not accounts and not re.search(r"callback", text, re.I):
+    if not accounts and not re.search(r"\bcallback\b", text, re.I):
         return None
     pending = bool(re.search(r"\b(?:pending|awaiting|not yet|unverified)\b", text, re.I))
     confirmed = bool(re.search(r"\b(?:confirmed|verified|established channel|completed)\b", text, re.I))
@@ -981,7 +985,7 @@ def semantic_distributed_decision(pkg):
         action = None
     if ledger and ledger[1][3] != current_order:
         return None
-    vendor = ledger[1][1] if ledger else "unknown"
+    vendor = ledger[1][1] if ledger else (invoice[1][3] if invoice else "unknown")
     invoice_id = invoice[1][0] if invoice else "unknown"
     if action is None and ledger and ledger[1][2] == current_order:
         if ledger[1][0] != (currency, amount):
@@ -1020,6 +1024,8 @@ def semantic_distributed_decision(pkg):
                  + " Archived, hypothetical and unrelated records were excluded.")
     if invoice is None:
         rationale += f" No distinct invoice number is supplied; {current_order} is the signed current commercial identifier."
+    if invoice is not None and ledger is None and vendor != "unknown":
+        rationale += f" No distinct vendor name is supplied; signed payee {vendor} is the current commercial-party identifier."
     if missing:
         rationale += " Missing source fields remain explicit: " + ", ".join(missing) + "."
     return {"action": action, "facts": facts, "evidenceRefs": evidence,
