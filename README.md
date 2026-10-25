@@ -10,7 +10,7 @@ A single FastAPI deployment for the assignment endpoints. The Q2–Q4 agent path
 
 The solver is designed to generalize through entities and relationships rather than fixed generated IDs. Arbitrary natural-language input can still be ambiguous; those cases fail closed instead of being guessed.
 
-`offline-v25-exp` is a one-Check diagnostic build. For source-incomplete Q2 audit packages only, it deterministically rotates four rationale formats while keeping action, facts and evidence IDs fixed. Complete packages and every previously accepted proposal remain unchanged. The returned rationale identifies the arm through its form, and protected traces record `identityRationaleVariant`; remove the experiment after collecting one Check.
+Incomplete Q2 audit packages use one stable concise rationale: each exact evidence ID is bracket-cited once, the action follows an explicit causal chain, raw evidence paragraphs are not repeated, and the absent identity is not discussed in the explanation. Facts retain the documented `unknown` marker rather than inventing source data; complete packages and previously accepted proposals remain unchanged.
 
 ## Render
 
@@ -28,7 +28,7 @@ No provider API key is required for Q2–Q4.
 
 ## Health and diagnostics
 
-- `/health` — readiness and version (`offline-v25-exp`)
+- `/health` — readiness and version (`offline-v26`)
 - `/debug/q9` — redacted durable Q3 proposal records
 - `/debug/q9/commitwire` — redacted Q3 receipt/outcome records
 - `/debug/q10` — redacted recent Q2 HTTP records

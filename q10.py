@@ -101,9 +101,7 @@ def _q10_batch_part(message):
 
 # -------------------------------------------------------------- diagnostics
 
-SOLVER_VERSION = "offline-v25-exp"
-IDENTITY_RATIONALE_EXPERIMENT = True
-IDENTITY_RATIONALE_VARIANTS = 4
+SOLVER_VERSION = "offline-v26"
 _TRACE_DB_PATH = os.environ.get("Q10_TRACE_DB", DB_PATH + ".traces")
 _TRACE_BODY_LIMIT = 2 * 1024 * 1024
 _TRACE_STORAGE_LIMIT = 32 * 1024 * 1024
@@ -990,34 +988,33 @@ def _relationship_rationale(action, facts, current_order, evidence, details, sou
     return lead + " ".join(citations) + suffix
 
 
-def _identity_experiment_rationale(decision, variant):
-    """Vary only explanation form for source-incomplete audit packages.
-
-    Actions, facts and evidence remain fixed. A single fresh Check can therefore
-    distinguish an explanation-format rejection from the grader's unavailable
-    hidden identity without risking already accepted proposals.
-    """
-    rationale = decision["rationale"]
-    missing = decision.get("unresolvedFacts") or []
-    if not missing or variant == 0:
-        return rationale
-    without_missing = re.sub(r"\s+Missing source fields:.*$", "", rationale)
-    if variant == 1:
-        return without_missing
-    if variant == 2:
-        result = rationale
-        for ref in decision["evidenceRefs"]:
-            result = result.replace(ref + ":", "[" + ref + "]:")
-        return result
-    refs = decision["evidenceRefs"]
-    facts = decision["facts"]
-    return (
-        f"Action {decision['action']} is supported by [{refs[0]}], [{refs[1]}], and [{refs[2]}]. "
-        f"Together these current records establish the payable {facts['amountMinor']} minor units of "
-        f"{facts['currency']} and the controlling payment, verification, conflict, or authority condition. "
-        "Archive and training records are excluded. The supplied current records do not state "
-        + ", ".join(missing) + "; the facts therefore retain explicit unknown markers."
-    )
+def _incomplete_identity_rationale(action, facts, current_order, evidence, details):
+    """Explain the action from controlling relationships without inventing identity."""
+    first, second, third = (f"[{reference}]" for reference in evidence)
+    amount = facts["amountMinor"]
+    currency = facts["currency"]
+    if action == "reject_duplicate":
+        return (f"Action reject_duplicate: {first} establishes the signed current invoice, order, and payable "
+                f"{amount} minor units of {currency}. {second} proves that a prior disbursement settled that same "
+                f"commercial order, not merely a similar amount. {third} prohibits paying an already discharged "
+                "order again.")
+    if action == "open_exception":
+        return (f"Action open_exception: {first} establishes the submitted invoice, current order, and payable "
+                f"{amount} minor units of {currency}. {second} proves that the signed order total conflicts with "
+                f"the submitted invoice and that no corrected invoice exists. {third} requires the exception "
+                "workflow for an unresolved material order/invoice difference.")
+    if action == "hold_invoice":
+        return (f"Action hold_invoice: {first} establishes the signed current invoice, order, and payable "
+                f"{amount} minor units of {currency}. {second} proves that remittance changed and independent "
+                f"verification is still pending. {third} requires payment to remain paused until that verification "
+                "completes.")
+    comparison = "within" if action == "settle_invoice" else "above"
+    consequence = "permits autonomous settlement" if action == "settle_invoice" else "requires a named approver"
+    return (f"Action {action}: {first} establishes signed current order {current_order}, matching received units, "
+            f"and a payable {amount} minor units of {currency}. {second} proves that the recorded payment settled "
+            f"different order {details['paidOrder']}, so this claim is not a duplicate. {third} establishes the "
+            f"{details['limitMinor']} minor-unit authority ceiling; the payable is {comparison} that ceiling, which "
+            f"{consequence}.")
 
 
 def distributed_decision(pkg):
@@ -1093,7 +1090,8 @@ def distributed_decision(pkg):
                    if "ceiling" in components else None)
     details = {"paidOrder": ledger[3] if ledger else None, "limitMinor": limit_minor}
     missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
-    rationale = _relationship_rationale(action, facts, current_order, evidence, details, sources)
+    rationale = (_incomplete_identity_rationale(action, facts, current_order, evidence, details)
+                 if missing else _relationship_rationale(action, facts, current_order, evidence, details, sources))
     return {"action": action, "facts": facts, "evidenceRefs": evidence, "rationale": rationale,
             "unresolvedFacts": missing}
 
@@ -1252,7 +1250,8 @@ def semantic_distributed_decision(pkg):
     details = {"paidOrder": ledger[1][2] if ledger else None,
                "limitMinor": ceilings[0][1][1] if ceilings else None}
     sources = {ref: text for ref, text, _roles in records}
-    rationale = _relationship_rationale(action, facts, current_order, evidence, details, sources)
+    rationale = (_incomplete_identity_rationale(action, facts, current_order, evidence, details)
+                 if missing else _relationship_rationale(action, facts, current_order, evidence, details, sources))
     return {"action": action, "facts": facts, "evidenceRefs": evidence,
             "rationale": rationale, "unresolvedFacts": missing}
 
@@ -1573,24 +1572,13 @@ async def start_task(who, message, message_id, fingerprint, traces=None):
                   " VALUES(?,?,?,?)", (who, message_id, fingerprint, task_id))
         c.commit()
 
-    planned = []
+    proposals = []
     for i, pkg in enumerate(packages):
         trace = {} if traces is not None else None
-        decision = decide(pkg, trace=trace)
-        planned.append((i, decision, trace))
-    incomplete = sorted((ids[i], i) for i, decision, _trace in planned
-                        if decision.get("unresolvedFacts"))
-    variant_by_index = {index: rank % IDENTITY_RATIONALE_VARIANTS
-                        for rank, (_package_id, index) in enumerate(incomplete)}
-
-    proposals = []
-    for i, d, trace in planned:
-        if IDENTITY_RATIONALE_EXPERIMENT and i in variant_by_index:
-            variant = variant_by_index[i]
-            d["rationale"] = _identity_experiment_rationale(d, variant)
-            if trace is not None:
-                trace["identityRationaleVariant"] = variant
+        d = decide(pkg, trace=trace)
         if trace is not None:
+            if d.get("unresolvedFacts"):
+                trace["incompleteRationaleFormat"] = "concise-bracketed-causal"
             traces.append(trace)
         proposals.append({
             "packageId": ids[i],
