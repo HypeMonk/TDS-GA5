@@ -205,6 +205,7 @@ class TraceTests(unittest.IsolatedAsyncioTestCase):
             unrelated[name].router = APIRouter()
         with patch.dict(sys.modules, {**unrelated, "q10": self.q}):
             main = module("main")
+        main._DEBUG_KEY = self.q._Q10_WIRE_KEY
         async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://test") as client:
             sent = await client.post("/message:send", headers=self.headers, json=self.batch())
             self.assertEqual(sent.status_code, 200, sent.text)
@@ -220,14 +221,25 @@ class TraceTests(unittest.IsolatedAsyncioTestCase):
             for index in range(5):
                 main.LOGS_Q11.append({"timestamp": float(index + 1), "method": "POST",
                     "url": "http://test/v2/incidents", "headers": {"x-debug-key": "q11-secret"},
-                    "body": json.dumps({"sensitive": {"accessToken": "private-q11"}, "index": index}),
+                    "body": json.dumps({"sensitive": {"accessToken": "private-q11"}, "index": index,
+                                        "incident": {"transcript": "private incident transcript"},
+                                        "dispatch": {"arguments": {"service": "svc-private"}}}),
                     "status_code": 200, "duration_ms": 1, "error": None, "response_body": "{}"})
-            recent = await client.get("/debug/logs/q11", params={"limit": 2})
+            self.assertEqual((await client.get("/debug/logs/q11", params={"limit": 2})).status_code, 403)
+            self.assertEqual((await client.get("/debug/logs/q11", params={"key": main._DEBUG_KEY})).status_code, 403)
+            self.assertEqual((await client.get("/debug/logs/q11", headers={"X-Debug-Key": "wrong"})).status_code, 403)
+            recent = await client.get("/debug/logs/q11", headers=self.admin, params={"limit": 2, "before": 6})
             self.assertEqual([json.loads(row["body"])["index"] for row in recent.json()], [3, 4])
             self.assertNotIn("q11-secret", recent.text)
             self.assertNotIn("private-q11", recent.text)
-            older = await client.get("/debug/logs/q11", params={"limit": 2, "before": 4})
+            self.assertIn("private incident transcript", recent.text)
+            self.assertIn("svc-private", recent.text)
+            older = await client.get("/debug/logs/q11", headers=self.admin, params={"limit": 2, "before": 4})
             self.assertEqual([json.loads(row["body"])["index"] for row in older.json()], [1, 2])
+            public_all = await client.get("/debug/logs")
+            self.assertNotIn("private incident transcript", public_all.text)
+            self.assertNotIn("svc-private", public_all.text)
+            self.assertNotIn("private-q11", public_all.text)
 
     async def test_trace_generation_cannot_change_decision(self):
         plain = self.q.decide(package())

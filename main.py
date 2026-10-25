@@ -5,6 +5,7 @@ import os
 import json
 import subprocess
 import hashlib
+import hmac
 import urllib.parse
 import re
 import uuid
@@ -43,17 +44,19 @@ LOGS_Q11 = deque(maxlen=200)
 
 _DEBUG_SECRET_KEYS = {"authorization", "cookie", "setcookie", "apikey", "accesstoken",
                       "password", "secret", "sensitive", "token", "privatekey", "debugkey", "xdebugkey"}
+_DEBUG_EXPORT_KEYS = {"transcript", "arguments", "prompt", "modelprompt", "toolresult", "result"}
+_DEBUG_KEY = os.environ.get("DEBUG_KEY", "")
 _DEBUG_SECRET_PATTERN = re.compile(
     r"(?i)Bearer\s+[^\s\"'<>]+|postgres(?:ql)?://[^\s\"'<>]+|\bsk-[a-z0-9_-]{8,}")
 
 
-def _debug_safe(value):
+def _debug_safe(value, *, diagnostic_access=False):
     if isinstance(value, dict):
         private = value.get("provenance") in ("confidential_internal", "private_internal")
         result = {}
         for key, item in value.items():
             normalized = re.sub(r"[^a-z]", "", str(key).lower())
-            if normalized in _DEBUG_SECRET_KEYS:
+            if normalized in _DEBUG_SECRET_KEYS or (not diagnostic_access and normalized in _DEBUG_EXPORT_KEYS):
                 result[key] = "[REDACTED]"
             elif private and key in ("text", "lines", "content"):
                 if isinstance(item, list):
@@ -61,16 +64,16 @@ def _debug_safe(value):
                 else:
                     result[key] = "[REDACTED]"
             else:
-                result[key] = _debug_safe(item)
+                result[key] = _debug_safe(item, diagnostic_access=diagnostic_access)
         return result
     if isinstance(value, list):
-        return [_debug_safe(item) for item in value]
+        return [_debug_safe(item, diagnostic_access=diagnostic_access) for item in value]
     if isinstance(value, str):
         return _DEBUG_SECRET_PATTERN.sub("[REDACTED]", value)
     return value
 
 
-def _safe_debug_entry(entry):
+def _safe_debug_entry(entry, *, diagnostic_access=False):
     result = dict(entry)
     headers = result.get("headers")
     if isinstance(headers, dict):
@@ -87,10 +90,16 @@ def _safe_debug_entry(entry):
         if not isinstance(raw, str) or not raw:
             continue
         try:
-            result[field] = json.dumps(_debug_safe(json.loads(raw)), ensure_ascii=False)
+            result[field] = json.dumps(_debug_safe(json.loads(raw), diagnostic_access=diagnostic_access), ensure_ascii=False)
         except (ValueError, TypeError):
             result[field] = _DEBUG_SECRET_PATTERN.sub("[REDACTED]", raw)
     return result
+
+
+def _debug_authorized(request: Request) -> bool:
+    supplied = request.headers.get("x-debug-key", "")
+    return bool(_DEBUG_KEY and supplied and hmac.compare_digest(
+        supplied.encode("utf-8"), _DEBUG_KEY.encode("utf-8")))
 
 # ==============================================================================
 # Middleware for Request Logging and Route-Based Log Partitioning
@@ -227,16 +236,21 @@ def get_q9_debug_logs():
 
 @app.get("/debug/q10")
 @app.get("/debug/logs/q10")
-def get_q10_debug_logs():
-    return [_safe_debug_entry(entry) for entry in LOGS_Q10]
+def get_q10_debug_logs(limit: int = 25, before: Optional[float] = None):
+    limit = max(1, min(limit, 100))
+    rows = [entry for entry in LOGS_Q10
+            if before is None or float(entry.get("timestamp", 0)) < before]
+    return [_safe_debug_entry(entry) for entry in rows[-limit:]]
 
 @app.get("/debug/q11")
 @app.get("/debug/logs/q11")
-def get_q11_debug_logs(limit: int = 25, before: Optional[float] = None):
+def get_q11_debug_logs(request: Request, limit: int = 25, before: Optional[float] = None):
+    if not _debug_authorized(request):
+        raise HTTPException(status_code=403, detail="Forbidden")
     limit = max(1, min(limit, 100))
     rows = [entry for entry in LOGS_Q11
             if before is None or float(entry.get("timestamp", 0)) < before]
-    return [_safe_debug_entry(entry) for entry in rows[-limit:]]
+    return [_safe_debug_entry(entry, diagnostic_access=True) for entry in rows[-limit:]]
 
 # ==============================================================================
 # Helper functions & Startup Config

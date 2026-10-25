@@ -101,7 +101,7 @@ def _q10_batch_part(message):
 
 # -------------------------------------------------------------- diagnostics
 
-SOLVER_VERSION = "offline-v21"
+SOLVER_VERSION = "offline-v22"
 _TRACE_DB_PATH = os.environ.get("Q10_TRACE_DB", DB_PATH + ".traces")
 _TRACE_BODY_LIMIT = 2 * 1024 * 1024
 _TRACE_STORAGE_LIMIT = 32 * 1024 * 1024

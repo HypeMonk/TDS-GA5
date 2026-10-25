@@ -26,16 +26,17 @@ No provider API key is required for Q2–Q4.
 
 ## Health and diagnostics
 
-- `/health` — readiness and version (`offline-v21`)
+- `/health` — readiness and version (`offline-v22`)
 - `/debug/q9` — redacted durable Q3 proposal records
 - `/debug/q9/commitwire` — redacted Q3 receipt/outcome records
 - `/debug/q10` — redacted recent Q2 HTTP records
 - `/debug/q11` — redacted recent Q4 HTTP records
-- `/debug/logs/q9`, `/debug/logs/q10` — equivalent request-log views
-- `/debug/logs/q11?limit=25&before=TIMESTAMP` — bounded, cursorable Q4 request logs; omit `before` for the newest records
+- `/debug/logs/q9` — equivalent Q3 request-log view
+- `/debug/logs/q10?limit=25&before=TIMESTAMP` — bounded, cursorable Q2 request logs
+- `/debug/logs/q11?limit=25&before=TIMESTAMP` — bounded, cursorable Q4 request logs requiring `X-Debug-Key: DEBUG_KEY`; query-string credentials are rejected
 - `/debug/q10/wire?key=DEBUG_KEY`, `/debug/q11/wire?key=DEBUG_KEY` — protected durable indexes
 
-Authorization/cookie headers, diagnostic keys, secret-shaped values, `sensitive` objects, and confidential/private source text are redacted from public diagnostics.
+Authorization/cookie headers, diagnostic keys, secret-shaped values, `sensitive` objects, and confidential/private source text are redacted from public diagnostics. Public aggregate logs also replace incident transcripts, prompts, tool arguments, and tool results; only the key-gated Q4 view retains those synthetic fields for debugging.
 
 ## Protected Q2 traces
 
