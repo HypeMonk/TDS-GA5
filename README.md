@@ -4,7 +4,7 @@ A single FastAPI deployment for the assignment endpoints. The Q2–Q4 agent path
 
 ## Offline decision model
 
-- **Invoice/A2A:** extracts current commercial identities, amounts, order/payment relationships, authority ceilings, bank verification, and exactly three controlling references. It supports both the ordinary cover/ledger layout and distributed/paraphrased records independent of file order. When a distributed record omits a distinct invoice number, the signed current order identifier is returned as the only supplied commercial identity. A missing human-readable vendor remains explicit rather than being replaced by an account number, and the rationale states each limitation.
+- **Invoice/A2A:** extracts current commercial identities, amounts, order/payment relationships, authority ceilings, bank verification, and exactly three controlling references. It supports both the ordinary cover/ledger layout and distributed/paraphrased records independent of file order. When a distributed record omits a distinct invoice number, the signed current order identifier is returned as the only supplied commercial identity and the claim is routed to `open_exception`, because exact duplicate and reconciliation checks cannot complete. A missing human-readable vendor remains explicit rather than being replaced by an account number.
 - **Mailroom:** selects actions from source kind, provenance, current authenticated state, signed scope, exact request identity, and least privilege. Standing approvals and request-controlled notices are handled separately. Contradictory or unsupported evidence returns HTTP 422 without a model call.
 - **Incident response:** classifies unique positive causal relations, validates catalog-bound arguments, evaluates bounded numeric/Boolean operating rules, enforces approval gates, and persists receipt-driven state and OTLP topology.
 
@@ -25,7 +25,7 @@ No provider API key is required for Q2–Q4.
 
 ## Health and diagnostics
 
-- `/health` — readiness and version (`offline-v16`)
+- `/health` — readiness and version (`offline-v17`)
 - `/debug/q9` — redacted durable Q3 proposal records
 - `/debug/q9/commitwire` — redacted Q3 receipt/outcome records
 - `/debug/q10` — redacted recent Q2 HTTP records

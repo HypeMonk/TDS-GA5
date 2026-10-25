@@ -801,6 +801,18 @@ def _relationship_rationale(action, facts, current_order, evidence, details):
                 f"{second} records a prior disbursement settling that same order, not merely a matching amount. "
                 f"{third} prohibits a second payment for an already discharged commercial order.")
     if action == "open_exception":
+        if details.get("identityMissing"):
+            if details.get("thirdRole") == "ceiling":
+                return (f"Action open_exception: {first} identifies signed current order {current_order} and payable "
+                        f"{facts['amountMinor']} minor units of {facts['currency']} but supplies no distinct invoice number. "
+                        f"{second} names vendor {facts['vendorName']}, binds the ledger to current order {current_order}, "
+                        "and applies the control requiring exception handling for material order/invoice uncertainty. "
+                        f"{third} states an authority ceiling, but financial authority cannot cure the missing invoice identity.")
+            return (f"Action open_exception: {first} identifies signed current order {current_order} and payable "
+                    f"{facts['amountMinor']} minor units of {facts['currency']} but supplies no distinct invoice number. "
+                    f"{second} names vendor {facts['vendorName']} and binds the ledger to current order {current_order}; "
+                    "without an invoice identity, exact duplicate and reconciliation checks cannot complete. "
+                    f"{third} requires the exception workflow for material order/invoice uncertainty.")
         return (f"Action open_exception: {first} identifies the current {identity}. "
                 f"{second} shows the signed order total {details.get('orderMinor')} differs from the submitted "
                 f"invoice total {facts['amountMinor']}. {third} requires the exception workflow for a material "
@@ -858,11 +870,12 @@ def distributed_decision(pkg):
     facts = {"vendorName": ledger[2] if ledger else "unknown",
              "invoiceNumber": signed[0] if signed else current_order,
              "amountMinor": amount, "currency": currency}
+    identity_incomplete = signed is None
     disagreement = bool(signed and signed[5])
     if order:
         disagreement |= order[1] != currency or _money_minor(order[2], order[1]) != amount
         disagreement |= order[3] != currency or _money_minor(order[4], order[3]) != amount
-    if disagreement:
+    if identity_incomplete or disagreement:
         action = "open_exception"
     elif ledger and ledger[3] == current_order:
         if ledger[0] != currency or _money_minor(ledger[1], ledger[0]) != amount:
@@ -879,8 +892,11 @@ def distributed_decision(pkg):
     else:
         return None
     role_ref = {key: refs.get(key) for key in ("signed", "order", "ledger", "bank", "ceiling", "controls")}
+    incomplete_exception_roles = (("order", "ledger", "ceiling")
+                                  if identity_incomplete and refs.get("controls") == refs.get("ledger") and refs.get("ceiling")
+                                  else ("order", "ledger", "controls"))
     required = {"reject_duplicate": ("signed", "ledger", "controls"),
-                "open_exception": ("signed", "order", "controls"),
+                "open_exception": (incomplete_exception_roles if identity_incomplete else ("signed", "order", "controls")),
                 "hold_invoice": ("signed", "bank", "controls"),
                 "settle_invoice": ("order", "ledger", "ceiling"),
                 "request_approval": ("order", "ledger", "ceiling")}[action]
@@ -891,7 +907,9 @@ def distributed_decision(pkg):
                    if "ceiling" in components else None)
     order_minor = (_money_minor(order[2], order[1]) if order else None)
     details = {"paidOrder": ledger[3] if ledger else None, "limitMinor": limit_minor,
-               "orderMinor": order_minor, "oldAccount": components.get("bank", (None, None))[0],
+               "orderMinor": order_minor, "identityMissing": identity_incomplete,
+               "thirdRole": required[2], "controlsInSecond": refs.get("controls") == refs.get("ledger"),
+               "oldAccount": components.get("bank", (None, None))[0],
                "newAccount": components.get("bank", (None, None))[1]}
     missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
     rationale = _relationship_rationale(action, facts, current_order, evidence, details)
@@ -1007,14 +1025,15 @@ def semantic_distributed_decision(pkg):
         return None
     current_order = invoice[1][1] if invoice else order[1][0]
     currency, amount = invoice[1][2] if invoice else order[1][1][0]
+    identity_incomplete = invoice is None
     if order:
         order_amounts = set(order[1][1])
-        if order[1][0] != current_order or len(order_amounts) != 1 or (currency, amount) not in order_amounts:
+        if identity_incomplete or order[1][0] != current_order or len(order_amounts) != 1 or (currency, amount) not in order_amounts:
             action = "open_exception"
         else:
             action = None
     else:
-        action = None
+        action = "open_exception" if identity_incomplete else None
     if ledger and ledger[1][3] != current_order:
         return None
     vendor = ledger[1][1] if ledger else "unknown"
@@ -1035,8 +1054,11 @@ def semantic_distributed_decision(pkg):
     role_ref = {"invoice": invoice[0] if invoice else None, "order": order[0] if order else None,
                 "ledger": ledger[0] if ledger else None, "bank": banks[0][0] if banks else None,
                 "ceiling": ceilings[0][0] if ceilings else None, "controls": controls[0] if len(controls) == 1 else None}
+    incomplete_exception_roles = (("order", "ledger", "ceiling")
+                                  if identity_incomplete and role_ref.get("controls") == role_ref.get("ledger") and role_ref.get("ceiling")
+                                  else ("order", "ledger", "controls"))
     required = {"reject_duplicate": ("invoice", "ledger", "controls"),
-                "open_exception": ("invoice", "order", "controls"),
+                "open_exception": (incomplete_exception_roles if identity_incomplete else ("invoice", "order", "controls")),
                 "hold_invoice": ("invoice", "bank", "controls"),
                 "settle_invoice": ("invoice", "ledger", "ceiling"),
                 "request_approval": ("invoice", "ledger", "ceiling")}[action]
@@ -1052,6 +1074,8 @@ def semantic_distributed_decision(pkg):
     details = {"paidOrder": ledger[1][2] if ledger else None,
                "limitMinor": ceilings[0][1][1] if ceilings else None,
                "orderMinor": order[1][1][0][1] if order and order[1][1] else None,
+               "identityMissing": identity_incomplete, "thirdRole": required[2],
+               "controlsInSecond": role_ref.get("controls") == role_ref.get("ledger"),
                "oldAccount": "the established account", "newAccount": "the proposed account"}
     rationale = _relationship_rationale(action, facts, current_order, evidence, details)
     if invoice is None:
