@@ -4,7 +4,7 @@ A single FastAPI deployment for the assignment endpoints. The Q2–Q4 agent path
 
 ## Offline decision model
 
-- **Invoice/A2A:** extracts current commercial identities, amounts, order/payment relationships, authority ceilings, bank verification, and exactly three controlling references. It supports both the ordinary cover/ledger layout and distributed/paraphrased records independent of file order. Missing vendor or invoice fields remain explicit `unknown` markers rather than invented values.
+- **Invoice/A2A:** extracts current commercial identities, amounts, order/payment relationships, authority ceilings, bank verification, and exactly three controlling references. It supports both the ordinary cover/ledger layout and distributed/paraphrased records independent of file order. A missing vendor remains an explicit `unknown`; when no distinct invoice number exists, the signed current order identifier is returned as the only supplied commercial identity and the rationale states that limitation.
 - **Mailroom:** selects actions from source kind, provenance, current authenticated state, signed scope, exact request identity, and least privilege. Standing approvals and request-controlled notices are handled separately. Contradictory or unsupported evidence returns HTTP 422 without a model call.
 - **Incident response:** classifies unique positive causal relations, validates catalog-bound arguments, evaluates bounded numeric/Boolean operating rules, enforces approval gates, and persists receipt-driven state and OTLP topology.
 

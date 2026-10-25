@@ -827,7 +827,7 @@ def distributed_decision(pkg):
     amount = _money_minor(signed[4] if signed else order[4], currency)
     if amount is None or (order and order[0] != current_order) or (ledger and ledger[4] != current_order):
         return None
-    facts = {"vendorName": ledger[2] if ledger else "unknown", "invoiceNumber": signed[0] if signed else "unknown",
+    facts = {"vendorName": ledger[2] if ledger else "unknown", "invoiceNumber": signed[0] if signed else current_order,
              "amountMinor": amount, "currency": currency}
     disagreement = bool(signed and signed[5])
     if order:
@@ -860,8 +860,9 @@ def distributed_decision(pkg):
                  + " ".join(f"{refs[kind]} supplies the current {kind} record."
                             for kind in ("signed", "order", "ledger", "bank", "ceiling", "controls") if kind in refs)
                  + " Commercial identity, payment history and the stated controls govern this decision; archived records do not.")
+    if signed is None:
+        rationale += f" No distinct invoice number is supplied; {current_order} is the signed current commercial identifier."
     if missing:
-        # Unknown markers preserve the legacy transport shape, not complete accounting identity.
         rationale += " Missing from the supplied records: " + ", ".join(missing) + "; 'unknown' is an explicit unresolved marker."
     return {"action": action, "facts": facts, "evidenceRefs": evidence, "rationale": rationale,
             "unresolvedFacts": missing}
@@ -1009,7 +1010,7 @@ def semantic_distributed_decision(pkg):
         if not ref or ref in evidence:
             return None
         evidence.append(ref)
-    facts = {"vendorName": vendor, "invoiceNumber": invoice_id,
+    facts = {"vendorName": vendor, "invoiceNumber": invoice_id if invoice_id != "unknown" else current_order,
              "amountMinor": amount, "currency": currency}
     missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
     rationale = (f"Action {action} follows current order {current_order} and the unique current records for "
@@ -1017,6 +1018,8 @@ def semantic_distributed_decision(pkg):
                  + " ".join(f"{ref} supplies the required {kind} relationship."
                             for kind, ref in zip(required, evidence))
                  + " Archived, hypothetical and unrelated records were excluded.")
+    if invoice is None:
+        rationale += f" No distinct invoice number is supplied; {current_order} is the signed current commercial identifier."
     if missing:
         rationale += " Missing source fields remain explicit: " + ", ".join(missing) + "."
     return {"action": action, "facts": facts, "evidenceRefs": evidence,
