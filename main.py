@@ -16,7 +16,7 @@ from collections import deque
 # Import Q8 - Q11 routers
 from q8 import router as q8_router
 from q9 import router as q9_router
-from q10 import router as q10_router
+from q10 import router as q10_router, SOLVER_VERSION
 from q11 import router as q11_router
 
 app = FastAPI(title="GA-5 Universal Solver Monolith")
@@ -42,7 +42,7 @@ LOGS_Q10 = deque(maxlen=200)
 LOGS_Q11 = deque(maxlen=200)
 
 _DEBUG_SECRET_KEYS = {"authorization", "cookie", "setcookie", "apikey", "accesstoken",
-                      "password", "secret", "sensitive", "token", "privatekey"}
+                      "password", "secret", "sensitive", "token", "privatekey", "debugkey", "xdebugkey"}
 _DEBUG_SECRET_PATTERN = re.compile(
     r"(?i)Bearer\s+[^\s\"'<>]+|postgres(?:ql)?://[^\s\"'<>]+|\bsk-[a-z0-9_-]{8,}")
 
@@ -74,7 +74,7 @@ def _safe_debug_entry(entry):
     result = dict(entry)
     headers = result.get("headers")
     if isinstance(headers, dict):
-        result["headers"] = {key: ("[REDACTED]" if key.lower() in ("authorization", "cookie", "x-api-key") else value)
+        result["headers"] = {key: ("[REDACTED]" if key.lower() in ("authorization", "cookie", "x-api-key", "x-debug-key") else value)
                              for key, value in headers.items()}
     if isinstance(result.get("url"), str):
         parts = urllib.parse.urlsplit(result["url"])
@@ -232,8 +232,11 @@ def get_q10_debug_logs():
 
 @app.get("/debug/q11")
 @app.get("/debug/logs/q11")
-def get_q11_debug_logs():
-    return [_safe_debug_entry(entry) for entry in LOGS_Q11]
+def get_q11_debug_logs(limit: int = 25, before: Optional[float] = None):
+    limit = max(1, min(limit, 100))
+    rows = [entry for entry in LOGS_Q11
+            if before is None or float(entry.get("timestamp", 0)) < before]
+    return [_safe_debug_entry(entry) for entry in rows[-limit:]]
 
 # ==============================================================================
 # Helper functions & Startup Config
@@ -322,12 +325,12 @@ def startup_event():
 @app.options("/")
 def read_root():
     email = os.environ.get("STUDENT_EMAIL") or os.environ.get("EMAIL") or "Not configured"
-    return {"status": "ok", "version": "offline-v18", "message": "GA-5 Universal Monolith is running!", "email": email}
+    return {"status": "ok", "version": SOLVER_VERSION, "message": "GA-5 Universal Monolith is running!", "email": email}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "offline-v18"}
+    return {"status": "ok", "version": SOLVER_VERSION}
 
 # ==============================================================================
 # Q2 - Spec-Driven Development: The Proration Bug

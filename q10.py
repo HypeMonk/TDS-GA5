@@ -28,7 +28,9 @@ Marks depend on these rules (all verified against captured grader traffic):
   * exactly three decisive evidence refs, cover-sheet/archive/training decoys
     excluded; amountMinor honours the currency's real minor-unit exponent.
 """
+import asyncio
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -97,6 +99,152 @@ def _q10_batch_part(message):
     return data if isinstance(data, (dict, list)) else None
 
 
+# -------------------------------------------------------------- diagnostics
+
+SOLVER_VERSION = "offline-v21"
+_TRACE_DB_PATH = os.environ.get("Q10_TRACE_DB", DB_PATH + ".traces")
+_TRACE_BODY_LIMIT = 2 * 1024 * 1024
+_TRACE_STORAGE_LIMIT = 32 * 1024 * 1024
+_TRACE_ROW_LIMIT = 500
+_TRACE_FAILURES = 0
+_TRACE_LAST_ERROR = None
+_TRACE_SECRET_KEYS = {"authorization", "cookie", "setcookie", "apikey", "accesstoken",
+                      "password", "secret", "sensitive", "token", "privatekey", "debugkey", "xdebugkey", "xapikey"}
+_TRACE_SECRET_TEXT = re.compile(r"(?i)Bearer\s+[^\s\"'<>]+|postgres(?:ql)?://[^\s\"'<>]+|\bsk-[a-z0-9_-]{8,}")
+
+
+def _trace_authorized(request):
+    supplied = request.headers.get("x-debug-key", "")
+    return bool(_Q10_WIRE_KEY and supplied and hmac.compare_digest(
+        supplied.encode("utf-8"), _Q10_WIRE_KEY.encode("utf-8")))
+
+
+def _trace_safe(value):
+    if isinstance(value, dict):
+        private = value.get("provenance") in ("confidential_internal", "private_internal")
+        return {key: ("[REDACTED]" if re.sub(r"[^a-z]", "", str(key).lower()) in _TRACE_SECRET_KEYS
+                      or (private and key in ("text", "lines", "content")) else _trace_safe(item))
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [_trace_safe(item) for item in value]
+    if isinstance(value, str):
+        return _TRACE_SECRET_TEXT.sub("[REDACTED]", value)
+    return value
+
+
+def _trace_body(raw):
+    summary = {"receivedBytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+               "truncated": len(raw) > _TRACE_BODY_LIMIT, "redactionApplied": True,
+               "storedBytes": 0, "body": None}
+    if summary["truncated"]:
+        summary["omittedReason"] = "body_size_limit"
+        return summary
+    if not raw:
+        return summary
+    try:
+        body = _trace_safe(json.loads(raw))
+    except (ValueError, UnicodeError):
+        summary["omittedReason"] = "invalid_json"
+        return summary
+    summary["body"] = body
+    summary["storedBytes"] = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+    return summary
+
+
+def _trace_store(event):
+    global _TRACE_FAILURES, _TRACE_LAST_ERROR
+    try:
+        encoded = json.dumps(_trace_safe(event), ensure_ascii=False)
+        payload_bytes = len(encoded.encode("utf-8"))
+        if payload_bytes > _TRACE_STORAGE_LIMIT:
+            compact = {key: event[key] for key in ("schemaVersion", "solverVersion", "received", "method", "path",
+                       "status", "taskId", "messageId") if key in event}
+            compact.update({"omittedReason": "event_size_limit", "originalPayloadBytes": payload_bytes})
+            encoded = json.dumps(_trace_safe(compact), ensure_ascii=False)
+            payload_bytes = len(encoded.encode("utf-8"))
+            if payload_bytes > _TRACE_STORAGE_LIMIT:
+                raise ValueError("trace metadata exceeds storage budget")
+        parent = os.path.dirname(_TRACE_DB_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        connection = sqlite3.connect(_TRACE_DB_PATH, timeout=0.25)
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("CREATE TABLE IF NOT EXISTS http_traces("
+                               "id INTEGER PRIMARY KEY AUTOINCREMENT, received REAL, task_id TEXT, "
+                               "message_id TEXT, status INTEGER, payload TEXT, payload_bytes INTEGER)")
+            connection.execute("CREATE INDEX IF NOT EXISTS trace_task ON http_traces(task_id, id)")
+            connection.execute("INSERT INTO http_traces(received,task_id,message_id,status,payload,payload_bytes) "
+                               "VALUES(?,?,?,?,?,?)", (event["received"], event.get("taskId"),
+                               event.get("messageId"), event["status"], encoded, payload_bytes))
+            retained_bytes = 0
+            for index, (row_id, size) in enumerate(connection.execute(
+                    "SELECT id,payload_bytes FROM http_traces ORDER BY id DESC").fetchall()):
+                retained_bytes += size
+                if index >= _TRACE_ROW_LIMIT or (index > 0 and retained_bytes > _TRACE_STORAGE_LIMIT):
+                    connection.execute("DELETE FROM http_traces WHERE id<=?", (row_id,))
+                    break
+            connection.commit()
+        finally:
+            connection.close()
+    except Exception as exc:
+        _TRACE_FAILURES += 1
+        _TRACE_LAST_ERROR = type(exc).__name__
+
+
+def _trace_rows(*, before=None, task_id=None, row_id=None, limit=25):
+    if not os.path.isfile(_TRACE_DB_PATH):
+        return []
+    connection = sqlite3.connect(_TRACE_DB_PATH, timeout=0.25)
+    connection.row_factory = sqlite3.Row
+    try:
+        clauses, values = [], []
+        for column, operator, value in (("id", "<", before), ("task_id", "=", task_id), ("id", "=", row_id)):
+            if value is not None:
+                clauses.append(column + operator + "?")
+                values.append(value)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        columns = "id,payload" if row_id is not None else "id,received,task_id,message_id,status,payload_bytes"
+        return [dict(row) for row in connection.execute(
+            "SELECT " + columns + " FROM http_traces" + where + " ORDER BY id DESC LIMIT ?", values + [limit])]
+    finally:
+        connection.close()
+
+
+async def _capture_trace(request, raw, response=None, error=None):
+    global _TRACE_FAILURES, _TRACE_LAST_ERROR
+    try:
+        request_capture = _trace_body(raw)
+        response_capture = _trace_body(getattr(response, "body", b""))
+        body = request_capture["body"]
+        message = body.get("message", {}) if isinstance(body, dict) else {}
+        message = message if isinstance(message, dict) else {}
+        result = response_capture["body"]
+        task = (result.get("task") or result) if isinstance(result, dict) else {}
+        task_id = task.get("id") or message.get("taskId") or request.path_params.get("task_id")
+        batches, outcomes = [], []
+        for part in message.get("parts", []) if isinstance(message.get("parts"), list) else []:
+            data = part.get("data") if isinstance(part, dict) else None
+            if isinstance(data, dict):
+                batches.append(data.get("batchId"))
+                outcomes.extend(data.get("results", []) if isinstance(data.get("results"), list) else [])
+        event = {"schemaVersion": 1, "solverVersion": SOLVER_VERSION, "received": time.time(),
+                 "method": request.method, "path": request.url.path,
+                 "status": response.status_code if response is not None else 500,
+                 "durationMs": round((time.monotonic() - request.state.q10_trace_start) * 1000, 2),
+                 "taskId": task_id, "messageId": message.get("messageId"), "batchIds": batches,
+                 "principalHash": hashlib.sha256(request.headers.get("authorization", "").encode()).hexdigest(),
+                 "request": request_capture, "response": response_capture,
+                 "requestHeaders": {name: request.headers[name] for name in ("content-type", "content-length", "a2a-version")
+                                    if name in request.headers},
+                 "decisions": getattr(request.state, "q10_decisions", []), "outcomes": outcomes,
+                 "errorType": type(error).__name__ if error is not None else None}
+        await asyncio.to_thread(_trace_store, event)
+    except Exception as exc:
+        _TRACE_FAILURES += 1
+        _TRACE_LAST_ERROR = type(exc).__name__
+
+
 # ------------------------------------------------------------ response types
 
 class A2AJSONResponse(JSONResponse):
@@ -120,16 +268,31 @@ class A2ARoute(APIRoute):
         original = super().get_route_handler()
 
         async def handler(request: Request):
+            tracing = bool(_Q10_WIRE_KEY) and "/debug" not in request.url.path
+            raw = b""
+            if tracing:
+                request.state.q10_trace_start = time.monotonic()
+                request.state.q10_decisions = []
+                try:
+                    raw = await request.body()
+                except Exception:
+                    tracing = False
             try:
                 response = await original(request)
             except RequestValidationError:
                 response = err(422, "INVALID_ARGUMENT",
                                "request failed schema validation")
+            except Exception as exc:
+                if tracing:
+                    await _capture_trace(request, raw, error=exc)
+                raise
             # Force the A2A media type on the transport routes (errors included),
             # but leave the discovery document to negotiate its own type - the
             # well-known agent card is conventionally application/json.
             if "/.well-known/" not in request.url.path:
                 response.headers["content-type"] = A2A_MEDIA_TYPE
+            if tracing:
+                await _capture_trace(request, raw, response=response)
             return response
 
         return handler
@@ -791,11 +954,45 @@ _AUDIT_NOISE = {
 _AUDIT_ARCHIVE = re.compile(r"^(?:Archived supplier memo|Archive examples|Historical bank transfer|A previous quarter|Operations discussed .+?training case|A closed reconciliation incident for a separate supplier)", re.I)
 
 
+def _relationship_rationale(action, facts, current_order, evidence, details, sources):
+    """Bind each citation to its source within the 1500-character contract."""
+    if action == "reject_duplicate":
+        reason = "The recorded disbursement discharged this same order; a second payment is prohibited."
+    elif action == "open_exception":
+        reason = "The current commercial records conflict and the discrepancy remains unresolved; exception handling is required."
+    elif action == "hold_invoice":
+        reason = "Remittance instructions changed and independent verification is pending; payment must pause."
+    else:
+        comparison = "within" if action == "settle_invoice" else "above"
+        consequence = "permits autonomous settlement" if action == "settle_invoice" else "requires a named approver"
+        reason = (f"The payable {facts['amountMinor']} minor units of {facts['currency']} is {comparison} "
+                  f"the {details['limitMinor']} minor-unit ceiling, which {consequence}. "
+                  f"The recorded payment discharged different order {details['paidOrder']}, not this claim.")
+    lead = f"Action {action} for order {current_order}: {reason} "
+    missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
+    suffix = (" Missing source fields: " + ", ".join(missing) + "; unknown is not an inferred identity."
+              if missing else "")
+    excerpts = [" ".join(sources[ref].split()) for ref in evidence]
+    overhead = sum(len(ref) + len(': "".') for ref in evidence) + len(evidence) - 1
+    budget = 1500 - len(lead) - len(suffix) - overhead
+    limits = [0] * len(excerpts)
+    for index in sorted(range(len(excerpts)), key=lambda i: len(excerpts[i])):
+        remaining = sum(limit == 0 for limit in limits)
+        limits[index] = min(len(excerpts[index]), budget // remaining)
+        budget -= limits[index]
+    citations = []
+    for ref, text, limit in zip(evidence, excerpts, limits):
+        if len(text) > limit:
+            text = text[:max(0, limit - 3)].rsplit(" ", 1)[0] + "..."
+        citations.append(f'{ref}: "{text}".')
+    return lead + " ".join(citations) + suffix
+
+
 def distributed_decision(pkg):
     """Join current invoice/order/ledger/control records instead of their file positions."""
     if cover_facts(pkg) is not None:
         return None
-    components, refs = {}, {}
+    components, refs, sources = {}, {}, {}
     for _doc, paragraph in _case_paragraphs(pkg):
         ref = BRACKET_REF.match(paragraph)
         if ref is None:
@@ -808,6 +1005,7 @@ def distributed_decision(pkg):
         rest = paragraph[ref.end():].strip()
         if _AUDIT_ARCHIVE.match(rest):
             continue
+        sources[ref.group(1)] = rest
         while rest:
             for kind, pattern in _AUDIT_COMPONENTS.items():
                 match = pattern.match(rest)
@@ -827,7 +1025,8 @@ def distributed_decision(pkg):
     amount = _money_minor(signed[4] if signed else order[4], currency)
     if amount is None or (order and order[0] != current_order) or (ledger and ledger[4] != current_order):
         return None
-    facts = {"vendorName": ledger[2] if ledger else "unknown", "invoiceNumber": signed[0] if signed else current_order,
+    facts = {"vendorName": ledger[2] if ledger else "unknown",
+             "invoiceNumber": signed[0] if signed else "unknown",
              "amountMinor": amount, "currency": currency}
     disagreement = bool(signed and signed[5])
     if order:
@@ -849,21 +1048,20 @@ def distributed_decision(pkg):
         action = "settle_invoice" if amount <= limit else "request_approval"
     else:
         return None
-    evidence = []
-    for key in ("signed", "order", "ledger", "bank", "ceiling", "controls"):
-        if key in refs and refs[key] not in evidence:
-            evidence.append(refs[key])
-    if len(evidence) != 3:
+    role_ref = {key: refs.get(key) for key in ("signed", "order", "ledger", "bank", "ceiling", "controls")}
+    required = {"reject_duplicate": ("signed", "ledger", "controls"),
+                "open_exception": ("signed", "order", "controls"),
+                "hold_invoice": ("signed", "bank", "controls"),
+                "settle_invoice": ("order", "ledger", "ceiling"),
+                "request_approval": ("order", "ledger", "ceiling")}[action]
+    evidence = [role_ref[kind] for kind in required]
+    if any(not ref for ref in evidence) or len(set(evidence)) != 3:
         return None
+    limit_minor = (_money_minor(components["ceiling"][2], components["ceiling"][1])
+                   if "ceiling" in components else None)
+    details = {"paidOrder": ledger[3] if ledger else None, "limitMinor": limit_minor}
     missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
-    rationale = (f"Action {action} follows current order {current_order} for {amount} minor units of {currency}. "
-                 + " ".join(f"{refs[kind]} supplies the current {kind} record."
-                            for kind in ("signed", "order", "ledger", "bank", "ceiling", "controls") if kind in refs)
-                 + " Commercial identity, payment history and the stated controls govern this decision; archived records do not.")
-    if signed is None:
-        rationale += f" No distinct invoice number is supplied; {current_order} is the signed current commercial identifier."
-    if missing:
-        rationale += " Missing from the supplied records: " + ", ".join(missing) + "; 'unknown' is an explicit unresolved marker."
+    rationale = _relationship_rationale(action, facts, current_order, evidence, details, sources)
     return {"action": action, "facts": facts, "evidenceRefs": evidence, "rationale": rationale,
             "unresolvedFacts": missing}
 
@@ -887,13 +1085,17 @@ def _semantic_invoice_record(text):
     if (len(set(invoices)) != 1 or len(set(orders)) != 1 or len(amounts) != 1
             or not re.search(r"\b(?:signed|commercial instrument|issued invoice|invoice record)\b", text, re.I)):
         return None
-    return invoices[0].upper(), orders[0].upper(), amounts[0]
+    payee = re.search(r"\b(?:payee|beneficiary|vendor(?: account)?)\s+(?:is\s+)?(.+?)(?=\s+and\s+[A-Z]{3}\s+\d|[,;.]|$)", text, re.I)
+    vendor = payee.group(1).strip() if payee else "unknown"
+    if re.fullmatch(r"AC-[A-Z0-9-]+", vendor, re.I):
+        vendor = "unknown"
+    return invoices[0].upper(), orders[0].upper(), amounts[0], vendor
 
 
 def _semantic_order_record(text):
     orders, amounts = re.findall(r"\bPO-[A-Z0-9-]+\b", text, re.I), _semantic_amounts(text)
     if (len(set(orders)) != 1 or not amounts
-            or not re.search(r"\b(?:purchase order|signed order|receiv\w*|goods|billed units|submitted invoice)\b", text, re.I)):
+            or not re.search(r"\b(?:signed (?:purchase )?order|purchase order (?:\S+\s+)?(?:is\s+)?(?:signed|approved)|receiv\w*|goods|billed units|submitted invoice)\b", text, re.I)):
         return None
     return orders[0].upper(), amounts
 
@@ -915,10 +1117,10 @@ def _semantic_bank_record(text):
     if not re.search(r"\b(?:bank|account|remittance|beneficiary|callback)\b", text, re.I):
         return None
     accounts = re.findall(r"\bAC-[A-Z0-9-]+\b", text, re.I)
-    if not accounts and not re.search(r"callback", text, re.I):
+    if not accounts and not re.search(r"\bcallback\b", text, re.I):
         return None
-    pending = bool(re.search(r"\b(?:pending|awaiting|not yet|unverified)\b", text, re.I))
-    confirmed = bool(re.search(r"\b(?:confirmed|verified|established channel|completed)\b", text, re.I))
+    pending = bool(re.search(r"\b(?:pending|awaiting|unverified)\b|\bnot(?:\s+yet)?\s+(?:confirmed|verified|completed)\b", text, re.I))
+    confirmed = not pending and bool(re.search(r"\b(?:confirmed|verified|established channel|completed)\b", text, re.I))
     changed = len(set(a.upper() for a in accounts)) > 1 or bool(re.search(r"\b(?:changed|different|new|replaced)\b", text, re.I))
     return changed, pending, confirmed
 
@@ -936,7 +1138,8 @@ def semantic_distributed_decision(pkg):
     for _doc, paragraph in _case_paragraphs(pkg):
         match = BRACKET_REF.match(paragraph)
         if match is None:
-            if paragraph and not _ARCHIVE_WORDS.search(paragraph):
+            plain = re.sub(r" Review location [A-Za-z]+; docket [0-9]+\.$", "", paragraph)
+            if paragraph and plain not in _AUDIT_NOISE and not _ARCHIVE_WORDS.search(paragraph):
                 return None
             continue
         if len(BRACKET_REF.findall(paragraph)) != 1:
@@ -948,7 +1151,8 @@ def semantic_distributed_decision(pkg):
             "invoice": _semantic_invoice_record(text), "order": _semantic_order_record(text),
             "ledger": _semantic_ledger_record(text), "bank": _semantic_bank_record(text),
             "ceiling": _semantic_ceiling_record(text),
-            "controls": bool(re.search(r"\b(?:duplicate|already (?:paid|settled)|second (?:payment|disbursement)|exception|bank change|remittance)\b", text, re.I)),
+            "controls": bool(re.search(r"\b(?:must|requires?|prohibits?|forbids?|do not pay|payment controls|duplicate control)\b", text, re.I)
+                             and re.search(r"\b(?:duplicate|already (?:paid|settled)|second (?:payment|disbursement)|exception|bank change|remittance|verification)\b", text, re.I)),
         }
         if not any(value for value in roles.values()):
             return None
@@ -981,7 +1185,7 @@ def semantic_distributed_decision(pkg):
         action = None
     if ledger and ledger[1][3] != current_order:
         return None
-    vendor = ledger[1][1] if ledger else "unknown"
+    vendor = ledger[1][1] if ledger else invoice[1][3] if invoice else "unknown"
     invoice_id = invoice[1][0] if invoice else "unknown"
     if action is None and ledger and ledger[1][2] == current_order:
         if ledger[1][0] != (currency, amount):
@@ -1010,29 +1214,93 @@ def semantic_distributed_decision(pkg):
         if not ref or ref in evidence:
             return None
         evidence.append(ref)
-    facts = {"vendorName": vendor, "invoiceNumber": invoice_id if invoice_id != "unknown" else current_order,
+    facts = {"vendorName": vendor, "invoiceNumber": invoice_id,
              "amountMinor": amount, "currency": currency}
     missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
-    rationale = (f"Action {action} follows current order {current_order} and the unique current records for "
-                 f"{amount} minor units of {currency}. "
-                 + " ".join(f"{ref} supplies the required {kind} relationship."
-                            for kind, ref in zip(required, evidence))
-                 + " Archived, hypothetical and unrelated records were excluded.")
-    if invoice is None:
-        rationale += f" No distinct invoice number is supplied; {current_order} is the signed current commercial identifier."
-    if missing:
-        rationale += " Missing source fields remain explicit: " + ", ".join(missing) + "."
+    details = {"paidOrder": ledger[1][2] if ledger else None,
+               "limitMinor": ceilings[0][1][1] if ceilings else None}
+    sources = {ref: text for ref, text, _roles in records}
+    rationale = _relationship_rationale(action, facts, current_order, evidence, details, sources)
     return {"action": action, "facts": facts, "evidenceRefs": evidence,
             "rationale": rationale, "unresolvedFacts": missing}
 
 
-def decide(pkg):
+def _decision_trace(pkg, decision, parser, attempts):
+    records = []
+    for doc, paragraph in _case_paragraphs(pkg):
+        refs = BRACKET_REF.findall(paragraph)
+        if not refs:
+            continue
+        prefix = BRACKET_REF.match(paragraph)
+        text = paragraph[prefix.end():].strip() if prefix else paragraph
+        components = {kind: list(match.groups()) for kind, pattern in _AUDIT_COMPONENTS.items()
+                      if (match := pattern.search(text))}
+        records.append({"document": doc.get("name"), "references": refs, "text": text,
+                        "provenance": doc.get("provenance"), "components": components,
+                        "selected": any(ref in decision["evidenceRefs"] for ref in refs),
+                        "archiveMarker": bool(_AUDIT_ARCHIVE.match(text))})
+    facts = {}
+    for field, value in decision["facts"].items():
+        matches = []
+        if value != "unknown":
+            for record in records:
+                if record["archiveMarker"]:
+                    continue
+                present = (value == amount and currency == decision["facts"]["currency"]
+                           for currency, amount in _semantic_amounts(record["text"]))
+                found = any(present) if field == "amountMinor" else str(value) in record["text"]
+                if found:
+                    matches.append({"document": record["document"], "references": record["references"]})
+        facts[field] = {"value": value, "status": "unresolved" if value == "unknown" else
+                        "present_in_source" if matches else "not_located", "sources": matches}
+    relationships = []
+    for record in records:
+        components = record["components"]
+        ledger, bank, ceiling = (components.get(kind) for kind in ("ledger", "bank", "ceiling"))
+        if ledger:
+            relationships.append({"kind": "payment", "references": record["references"],
+                                  "paidOrder": ledger[3], "currentOrder": ledger[4],
+                                  "sameOrder": ledger[3] == ledger[4]})
+        if bank:
+            relationships.append({"kind": "bank", "references": record["references"],
+                                  "oldAccount": bank[0], "newAccount": bank[1], "verification": bank[2]})
+        if ceiling:
+            limit = _money_minor(ceiling[2], ceiling[1])
+            same_currency = ceiling[0] == ceiling[1] == decision["facts"]["currency"]
+            relationships.append({"kind": "authority", "references": record["references"],
+                                  "limitMinor": limit, "amountMinor": decision["facts"]["amountMinor"],
+                                  "currencyMatches": same_currency,
+                                  "withinLimit": decision["facts"]["amountMinor"] <= limit
+                                  if same_currency and limit is not None else None})
+    warnings = ["unresolved_" + field for field, item in facts.items() if item["status"] == "unresolved"]
+    if parser == "heuristic":
+        warnings.append("heuristic_fallback_requires_review")
+    return {"packageId": pkg.get("packageId"), "packageSha256": sha(canonical(pkg)),
+            "parser": parser, "parserAttempts": attempts, "decision": decision,
+            "factProvenance": facts, "relationships": relationships, "evidence": records,
+            "warnings": warnings, "hiddenGraderAcceptanceKnown": False}
+
+
+def decide(pkg, trace=None):
     """Read action, facts and the exact three evidence refs. Deterministic on
     the real corpus; a layout-deviating package degrades to heuristics rather
     than to a model."""
-    distributed = distributed_decision(pkg) or semantic_distributed_decision(pkg)
-    if distributed is not None:
-        return distributed
+    attempts = []
+
+    def finish(decision, parser):
+        if trace is not None:
+            try:
+                trace.update(_decision_trace(pkg, decision, parser, attempts))
+            except Exception as exc:
+                trace.update({"packageId": pkg.get("packageId"), "parser": parser,
+                              "traceError": type(exc).__name__})
+        return decision
+
+    for parser, reader in (("distributed", distributed_decision), ("semantic", semantic_distributed_decision)):
+        distributed = reader(pkg)
+        attempts.append({"parser": parser, "matched": distributed is not None})
+        if distributed is not None:
+            return finish(distributed, parser)
     paragraph = decisive_paragraph(pkg)
     if paragraph:
         refs = BRACKET_REF.findall(paragraph)
@@ -1040,9 +1308,11 @@ def decide(pkg):
         facts = cover_facts(pkg)
         action = apply_authority_rule(paragraph, facts, action)
         if len(refs) == 3 and action in ACTIONS and facts:
-            return {"action": action, "facts": facts, "evidenceRefs": refs,
-                    "rationale": build_rationale(action, refs, facts, paragraph)}
+            attempts.append({"parser": "decisive_paragraph", "matched": True})
+            return finish({"action": action, "facts": facts, "evidenceRefs": refs,
+                           "rationale": build_rationale(action, refs, facts, paragraph)}, "decisive_paragraph")
 
+    attempts.append({"parser": "decisive_paragraph", "matched": False})
     # Fallback (defensive; not exercised by the graded packages).
     text = _all_text(pkg)
     action = classify_decisive(text) or heuristic_action(text)
@@ -1058,8 +1328,8 @@ def decide(pkg):
     if not refs:
         refs = BRACKET_REF.findall(text)[:3] or mine_refs(text)
     rationale = build_rationale(action, refs, facts, paragraph or text[:400])
-    return {"action": action, "facts": facts, "evidenceRefs": refs,
-            "rationale": rationale}
+    return finish({"action": action, "facts": facts, "evidenceRefs": refs,
+                   "rationale": rationale}, "heuristic")
 
 
 # ------------------------------------------------------------ A2A objects
@@ -1215,10 +1485,11 @@ async def message_send(request: Request):
 
     if message.get("taskId"):
         return await continue_task(who, message, message_id, fingerprint)
-    return await start_task(who, message, message_id, fingerprint)
+    return await start_task(who, message, message_id, fingerprint,
+                            traces=getattr(request.state, "q10_decisions", None))
 
 
-async def start_task(who, message, message_id, fingerprint):
+async def start_task(who, message, message_id, fingerprint, traces=None):
     part = find_part(message, MODE_BATCH) or any_data_part(message)
     data = part.get("data") if isinstance(part, dict) else None
     if not isinstance(data, dict):
@@ -1272,7 +1543,10 @@ async def start_task(who, message, message_id, fingerprint):
 
     proposals = []
     for i, pkg in enumerate(packages):
-        d = decide(pkg)
+        trace = {} if traces is not None else None
+        d = decide(pkg, trace=trace)
+        if trace is not None:
+            traces.append(trace)
         proposals.append({
             "packageId": ids[i],
             "actionId": "act_" + sha("q10-action-v1", task_id, ids[i])[:12],
@@ -1494,6 +1768,40 @@ async def cancel_task(task_id: str, request: Request):
 # --------------------------------------------------------------------------- #
 # v3 debug wire (not part of grading): local replay/audit capture browser gate #
 # --------------------------------------------------------------------------- #
+@router.get("/debug/q10/traces")
+async def q10_trace_index(request: Request):
+    if not _trace_authorized(request):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    try:
+        limit = max(1, min(int(request.query_params.get("limit", "25")), 100))
+        before = int(request.query_params["before"]) if "before" in request.query_params else None
+    except ValueError:
+        return JSONResponse({"error": "invalid pagination"}, status_code=400)
+    try:
+        rows = await asyncio.to_thread(_trace_rows, before=before,
+                                       task_id=request.query_params.get("taskId"), limit=limit)
+    except sqlite3.Error:
+        return JSONResponse({"error": "trace storage unavailable"}, status_code=503)
+    return JSONResponse({"solverVersion": SOLVER_VERSION, "rows": rows,
+                         "nextBefore": rows[-1]["id"] if len(rows) == limit else None,
+                         "captureFailures": _TRACE_FAILURES, "lastCaptureError": _TRACE_LAST_ERROR,
+                         "bodyLimitBytes": _TRACE_BODY_LIMIT, "retainedPayloadLimitBytes": _TRACE_STORAGE_LIMIT,
+                         "rowLimit": _TRACE_ROW_LIMIT})
+
+
+@router.get("/debug/q10/traces/{trace_id}")
+async def q10_trace_detail(trace_id: int, request: Request):
+    if not _trace_authorized(request):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    try:
+        rows = await asyncio.to_thread(_trace_rows, row_id=trace_id, limit=1)
+    except sqlite3.Error:
+        return JSONResponse({"error": "trace storage unavailable"}, status_code=503)
+    if not rows:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({"id": rows[0]["id"], **json.loads(rows[0]["payload"])})
+
+
 @router.get("/debug/q10/wire")
 async def q10_wire_index(request: Request):
     if not _Q10_WIRE_KEY or request.query_params.get("key") != _Q10_WIRE_KEY:

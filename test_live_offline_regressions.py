@@ -1,6 +1,7 @@
 """Sanitized regressions for the 2026-10-25 offline GA3 evidence families."""
 import asyncio
 import importlib.util
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -157,7 +158,7 @@ class OfflineLiveRegressions(unittest.TestCase):
     def test_distributed_invoice_records_are_order_independent(self):
         expected = {
             "duplicate": ("reject_duplicate", "INV-TEST-1", "Example Supplier", []),
-            "settle_missing_invoice": ("settle_invoice", "PO-TEST-2", "Example Supplier", []),
+            "settle_missing_invoice": ("settle_invoice", "unknown", "Example Supplier", ["invoiceNumber"]),
             "exception": ("open_exception", "INV-TEST-3", "unknown", ["vendorName"]),
         }
         for case, values in expected.items():
@@ -167,6 +168,9 @@ class OfflineLiveRegressions(unittest.TestCase):
                 self.assertEqual((decision["action"], decision["facts"]["invoiceNumber"],
                                   decision["facts"]["vendorName"], decision["unresolvedFacts"]), values)
                 self.assertEqual(len(decision["evidenceRefs"]), 3)
+                self.assertIn("Action " + decision["action"], decision["rationale"])
+                for reference in decision["evidenceRefs"]:
+                    self.assertEqual(decision["rationale"].count(reference), 1)
                 reversed_pkg = dict(pkg, documents=list(reversed(pkg["documents"])))
                 self.assertEqual(q10.decide(reversed_pkg), decision)
 
@@ -240,8 +244,70 @@ class OfflineLiveRegressions(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertEqual(decision["action"], action)
                 self.assertEqual(len(decision["evidenceRefs"]), 3)
+                for reference in decision["evidenceRefs"]:
+                    self.assertEqual(decision["rationale"].count(reference), 1)
                 shuffled = dict(package, documents=[package["documents"][2], package["documents"][0], package["documents"][1]])
                 self.assertEqual(q10.decide(shuffled), decision)
+
+    def test_revoked_credential_generation_uses_runbook_and_pages_on_timeout(self):
+        case = incident("rotation", [
+            "svc_rotation still uses credential generation 41 after the vault revoked it in favour of generation 42.",
+            "Failures start with credential revocation; deployment and all other service health indicators are unchanged. The credential recovery playbook must be consulted, but its repository is currently timing out.",
+            "Runbook: a failed mandatory lookup requires paging the service owner, without further changes.",
+        ])
+        body = {"profile": q11.PROFILE, "runId": "run_rotation_regression",
+                "agentName": "incident-response", "publicMarker": "public_rotation_regression",
+                "sensitive": {"accessToken": "private_rotation_regression"},
+                "incident": case, "toolCatalog": CATALOG, "policy": POLICY}
+        decision = q11.heuristic_decision(case, POLICY, CATALOG)
+        self.assertEqual(decision["rootCause"], "secret_rotation_mismatch")
+        self.assertEqual(decision["evidence"], ["ev_rotation_0", "ev_rotation_1", "ev_rotation_2"])
+        self.assertEqual(decision["diagnostics"], [{
+            "toolName": "read_runbook",
+            "arguments": {"service": "svc_rotation", "topic": "secret-rotation"},
+            "evidence": ["ev_rotation_2"],
+        }])
+        self.assertEqual(decision["effect"]["toolName"], "page_owner")
+        self.assertEqual(decision["effect"]["arguments"], {"service": "svc_rotation", "severity": "SEV-1"})
+        self.assertTrue(decision["effect"]["on_diagnostic_timeout"])
+
+        async def exercise():
+            app = FastAPI()
+            app.include_router(q11.router)
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://offline") as client:
+                first = await client.post("/v2/incidents", json=body)
+                self.assertEqual(first.status_code, 200, first.text)
+                waiting = first.json()
+                self.assertEqual(waiting["status"], "waiting")
+                self.assertEqual([item["toolName"] for item in waiting["dispatches"]], ["read_runbook"])
+                diagnostic = waiting["dispatches"][0]
+                timeout = {"receiptId": "receipt_rotation_timeout", "outcomes": [{
+                    "actionId": diagnostic["actionId"], "callId": diagnostic["callId"],
+                    "attempt": diagnostic["attempt"], "status": 0, "errorType": "timeout",
+                    "resultClass": "unavailable", "nonce": "nonce_rotation_timeout",
+                }]}
+                notified = await client.post("/v2/incidents/run_rotation_regression/receipts", json=timeout)
+                self.assertEqual(notified.status_code, 200, notified.text)
+                page = notified.json()["dispatches"]
+                self.assertEqual(len(page), 1)
+                self.assertEqual((page[0]["phase"], page[0]["toolName"]), ("effect", "page_owner"))
+                self.assertEqual(page[0]["arguments"], {"service": "svc_rotation", "severity": "SEV-1"})
+                effect_result = {"receiptId": "receipt_rotation_page", "outcomes": [{
+                    "actionId": page[0]["actionId"], "callId": page[0]["callId"],
+                    "attempt": page[0]["attempt"], "status": 200,
+                    "resultClass": "effect_applied", "nonce": "nonce_rotation_page",
+                }]}
+                final = await client.post("/v2/incidents/run_rotation_regression/receipts", json=effect_result)
+                self.assertEqual(final.status_code, 200, final.text)
+                result = final.json()
+                self.assertEqual((result["status"], result["chosenEffect"]), ("completed", "page_owner"))
+                self.assertNotIn("private_rotation_regression", json.dumps(result))
+                spans = result["otlp"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                self.assertEqual(len({span["spanId"] for span in spans}), len(spans))
+                self.assertEqual(sum(span["name"] == "chat incident-plan" for span in spans), 1)
+                self.assertEqual(sum(span["name"] == "execute_tool read_runbook" for span in spans), 1)
+                self.assertEqual(sum(span["name"] == "execute_tool page_owner" for span in spans), 1)
+        asyncio.run(exercise())
 
     def test_new_incident_relations_and_delegation_rules(self):
         cases = [

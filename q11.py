@@ -754,7 +754,10 @@ _FAILURE_RELATIONS = {
     ),
     "secret_rotation_mismatch": (
         r"secret rotation.{0,90}(?:promoted|credential|revoked|mismatch)",
-        r"(?:secret|credential).{0,60}(?:version|generation).{0,90}vault.{0,60}(?:promoted|accepts)",
+        r"(?:secret|credential).{0,60}(?:version|generation).{0,90}vault.{0,60}(?:promoted|accepts|revoked|replaced)",
+        r"vault.{0,80}(?:revoked|replaced|promoted).{0,100}(?:secret|credential).{0,40}(?:version|generation)",
+        r"(?:failures?|authentication errors?).{0,40}(?:start|begin|follow).{0,50}credential revocation",
+        r"(?:secret|credential).{0,60}(?:version|generation).{0,60}(?:mismatch|revoked|retired|superseded)",
         r"authentication.{0,60}(?:broke|fail).{0,60}(?:credential|revocation|retired)",
     ),
 }
@@ -930,8 +933,16 @@ def _operating_rules(signal_text: str, root_cause: str) -> Dict[str, Any]:
             raise HTTPException(status_code=422, detail="Conflicting operating remedies")
         result.update(selected)
 
-    if re.search(r"(?:notify|page|contact)\s+(?:the\s+)?(?:owning team|service owner|owner)\s+on timeout",
-                 signal_text, re.I):
+    timeout_notification = (
+        r"(?:notify|page|contact)\s+(?:the\s+)?(?:owning team|service owner|owner)\s+on timeout",
+        r"(?:failed|timed[- ]?out)\s+(?:mandatory\s+)?(?:runbook|playbook|repository|lookup).{0,80}"
+        r"(?:requires?|must|should)\s+(?:page|paging|notify|contact).{0,30}(?:service owner|owner|owning team)",
+        r"(?:runbook|playbook|repository|lookup).{0,80}(?:timing out|timed out|unavailable|failed).{0,120}"
+        r"(?:requires?|must|should)\s+(?:page|paging|notify|contact).{0,30}(?:service owner|owner|owning team)",
+        r"(?:failed|timed[- ]?out)\s+(?:mandatory\s+)?lookup\s+(?:requires?|must|should)\s+"
+        r"(?:page|paging|notify|contact).{0,30}(?:service owner|owner|owning team)",
+    )
+    if any(re.search(pattern, signal_text, re.I) for pattern in timeout_notification):
         result["on_diagnostic_timeout"] = True
     return result
 
