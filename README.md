@@ -4,13 +4,23 @@ A single FastAPI deployment for the assignment endpoints. The Q2–Q4 agent path
 
 ## Offline decision model
 
-- **Invoice/A2A:** extracts current commercial identities, amounts, order/payment relationships, authority ceilings, bank verification, and exactly three controlling references. It supports both the ordinary cover/ledger layout and distributed/paraphrased records independent of file order. When a distributed record omits a distinct invoice number or human-readable vendor, that field remains `unknown` rather than being invented. The evidence-backed action still follows the signed order/invoice, current ledger, verification state, and authority boundary.
+- **Invoice/A2A:** extracts current commercial identities, amounts, order/payment relationships, authority ceilings, bank verification, and exactly three controlling references. It supports both the ordinary cover/ledger layout and distributed/paraphrased records independent of file order. The `offline-v31` candidate uses the supplied current-order or signed-payee identifier when a separate invoice number or human-readable vendor is absent. It does not manufacture an invoice number or vendor name; truly unsupported identities remain `unknown`. Actions follow the signed records, ledger, verification state, and authority boundary.
 - **Mailroom:** selects actions from source kind, provenance, current authenticated state, signed scope, exact request identity, and least privilege. Standing approvals and request-controlled notices are handled separately. Contradictory or unsupported evidence returns HTTP 422 without a model call.
 - **Incident response:** classifies unique positive causal relations, validates catalog-bound arguments, evaluates bounded numeric/Boolean operating rules, enforces approval gates, and persists receipt-driven state and OTLP topology.
 
 The solver is designed to generalize through entities and relationships rather than fixed generated IDs. Arbitrary natural-language input can still be ambiguous; those cases fail closed instead of being guessed.
 
-Incomplete Q2 audit packages use one stable concise rationale: each exact evidence ID is bracket-cited once, the action follows an explicit causal chain, raw evidence paragraphs are not repeated, and the absent identity is not discussed in the explanation. Facts retain the documented `unknown` marker rather than inventing source data; complete packages and previously accepted proposals remain unchanged.
+## Q2 Render business candidate
+
+`offline-v31` includes the Q2 business candidate based on the Render deployment's retained invoice logs. All nine recorded rejected audit proposals had an `unknown` identity; accepted audit proposals had complete identities. The candidate binds a missing invoice label to the explicit signed current order, and a missing human-readable vendor label to the explicit signed payee account. It restores the detailed rationale quoting each controlling source. This is a source-supported schema interpretation, not a confirmed hidden-grader expectation.
+
+The candidate leaves previously populated facts, actions, monetary amounts, currencies, and evidence references unchanged in the captured rejected cases. Recorded accepted proposals are replayed to check for regressions. Q3 source, task lifecycle, local SQLite storage, and dependencies are unchanged. This branch is based on `origin/main`, not the separate Vercel/PostgreSQL repair branch. Full marks require a new live evaluation; local tests cannot establish them.
+
+## Q4 Render audit wording fix
+
+`offline-v31` also extends two narrowly scoped causal relations: database connection acquisition/checkout timing out, and request queues with saturated workers as arrival rate rises. These cover the two protected audit inputs that returned `Incident failure is unsupported or ambiguous`. Negated timeout descriptions remain excluded, and a diagnosis still requires exactly one supported cause; the patch does not guess a cause or suppress valid errors.
+
+Regression tests cover the original exported failures, close paraphrases, conflicting/negated evidence, service scope, and complete local receipt/trace/replay workflows. Scaling still follows the supplied freeze and capacity rules: the captured `freeze=1` cases choose `page_owner`, not `scale_service`. Q3 is untouched and no database or provider dependency is added.
 
 ## Render
 
@@ -28,7 +38,7 @@ No provider API key is required for Q2–Q4.
 
 ## Health and diagnostics
 
-- `/health` — readiness and version (`offline-v26`)
+- `/health` — readiness and version (`offline-v31`)
 - `/debug/q9` — redacted durable Q3 proposal records
 - `/debug/q9/commitwire` — redacted Q3 receipt/outcome records
 - `/debug/q10` — redacted recent Q2 HTTP records
@@ -73,6 +83,8 @@ The analysis preserves each rejected proposal's parser, facts, evidence, rationa
 
 ```powershell
 python -I -B test_q10_evidence.py
+python -I -B test_q2_render_business.py
+python -I -B test_q4_render_audits.py
 python -I -B test_q10_traces.py
 python -I -B test_capture_q2_traces.py
 python -I -B test_analyze_q2_traces.py

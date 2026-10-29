@@ -101,7 +101,7 @@ def _q10_batch_part(message):
 
 # -------------------------------------------------------------- diagnostics
 
-SOLVER_VERSION = "offline-v26"
+SOLVER_VERSION = "offline-v31"
 _TRACE_DB_PATH = os.environ.get("Q10_TRACE_DB", DB_PATH + ".traces")
 _TRACE_BODY_LIMIT = 2 * 1024 * 1024
 _TRACE_STORAGE_LIMIT = 32 * 1024 * 1024
@@ -1054,8 +1054,9 @@ def distributed_decision(pkg):
     amount = _money_minor(signed[4] if signed else order[4], currency)
     if amount is None or (order and order[0] != current_order) or (ledger and ledger[4] != current_order):
         return None
-    facts = {"vendorName": ledger[2] if ledger else "unknown",
-             "invoiceNumber": signed[0] if signed else "unknown",
+    # These distributed records may provide only a current-order ID or signed payee ID.
+    facts = {"vendorName": ledger[2] if ledger else signed[2] if signed else "unknown",
+             "invoiceNumber": signed[0] if signed else current_order,
              "amountMinor": amount, "currency": currency}
     disagreement = bool(signed and signed[5])
     if order:
@@ -1090,8 +1091,7 @@ def distributed_decision(pkg):
                    if "ceiling" in components else None)
     details = {"paidOrder": ledger[3] if ledger else None, "limitMinor": limit_minor}
     missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
-    rationale = (_incomplete_identity_rationale(action, facts, current_order, evidence, details)
-                 if missing else _relationship_rationale(action, facts, current_order, evidence, details, sources))
+    rationale = _relationship_rationale(action, facts, current_order, evidence, details, sources)
     return {"action": action, "facts": facts, "evidenceRefs": evidence, "rationale": rationale,
             "unresolvedFacts": missing}
 
@@ -1117,8 +1117,6 @@ def _semantic_invoice_record(text):
         return None
     payee = re.search(r"\b(?:payee|beneficiary|vendor(?: account)?)\s+(?:is\s+)?(.+?)(?=\s+and\s+[A-Z]{3}\s+\d|[,;.]|$)", text, re.I)
     vendor = payee.group(1).strip() if payee else "unknown"
-    if re.fullmatch(r"AC-[A-Z0-9-]+", vendor, re.I):
-        vendor = "unknown"
     return invoices[0].upper(), orders[0].upper(), amounts[0], vendor
 
 
@@ -1216,7 +1214,7 @@ def semantic_distributed_decision(pkg):
     if ledger and ledger[1][3] != current_order:
         return None
     vendor = ledger[1][1] if ledger else invoice[1][3] if invoice else "unknown"
-    invoice_id = invoice[1][0] if invoice else "unknown"
+    invoice_id = invoice[1][0] if invoice else current_order
     if action is None and ledger and ledger[1][2] == current_order:
         if ledger[1][0] != (currency, amount):
             return None
@@ -1250,8 +1248,7 @@ def semantic_distributed_decision(pkg):
     details = {"paidOrder": ledger[1][2] if ledger else None,
                "limitMinor": ceilings[0][1][1] if ceilings else None}
     sources = {ref: text for ref, text, _roles in records}
-    rationale = (_incomplete_identity_rationale(action, facts, current_order, evidence, details)
-                 if missing else _relationship_rationale(action, facts, current_order, evidence, details, sources))
+    rationale = _relationship_rationale(action, facts, current_order, evidence, details, sources)
     return {"action": action, "facts": facts, "evidenceRefs": evidence,
             "rationale": rationale, "unresolvedFacts": missing}
 

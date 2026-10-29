@@ -699,7 +699,7 @@ def _positive_cause_text(signal: List[Tuple[str, str]]) -> str:
     observations = []
     failure_words = (r"exhaust(?:ed|ion)?|expir(?:ed|y)|fail(?:ed|ure|s)?|"
                      r"regression|saturat(?:ed|ion)?|recurs(?:ion|ive)?|mismatch|"
-                     r"timeout|malformed|revoked|broke(?:n)?")
+                     r"timeouts?|times? out|timed out|malformed|revoked|broke(?:n)?")
     for _eid, text in signal:
         body = re.sub(r"^[a-z][a-z -]{2,48}:\s*", "", text, flags=re.I)
         if re.search(r"change-control register|replicas operating\s*=|operating replicas\s*=|\brunbook\b|\brule:", body, re.I):
@@ -733,6 +733,7 @@ _FAILURE_RELATIONS = {
         r"pool.{0,60}(?:acquisition|checkout|lease).{0,60}(?:timeout|time out|wait)",
         r"(?:database|connection).{0,40}pool.{0,60}(?:exhaust|full|saturat)",
         r"database.{0,60}(?:reached|exceeded).{0,40}connection ceiling",
+        r"database connections?.{0,80}connection (?:acquisition|checkout|lease).{0,50}(?:times? out|timed out|timeouts?)",
     ),
     "dependency_certificate_expired": (
         r"expired.{0,30}certificate",
@@ -751,6 +752,7 @@ _FAILURE_RELATIONS = {
         r"(?:trial|extra|controlled).{0,30}replica.{0,50}drain.{0,30}queue",
         r"request saturation.{0,60}(?:latency|reproduces)",
         r"per-replica utilization is pinned.{0,50}(?:load|traffic).{0,80}backlog growth follows traffic spikes",
+        r"request queues?.{0,60}(?:workers?|replicas?).{0,20}saturated.{0,40}arrival rate\s+(?:rises?|increases?)",
     ),
     "secret_rotation_mismatch": (
         r"secret rotation.{0,90}(?:promoted|credential|revoked|mismatch)",
