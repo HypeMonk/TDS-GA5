@@ -4,3 +4,4 @@ pydantic==2.5.2
 python-dotenv==1.0.0
 httpx==0.25.1
 cryptography==42.0.8
+psycopg[binary]==3.3.6

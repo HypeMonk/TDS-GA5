@@ -2,6 +2,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import sys
@@ -199,10 +200,16 @@ class TraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(detail["originalPayloadBytes"], 5000)
 
     async def test_main_middleware_preserves_body_and_redacts_debug_key(self):
+        env = patch.dict(os.environ, {"SOLVER_LOG_DB": str(Path(self.folder.name) / "http.db")})
+        env.start()
+        self.addCleanup(env.stop)
         unrelated = {}
         for name in ("q8", "q9", "q11"):
             unrelated[name] = types.ModuleType(name)
             unrelated[name].router = APIRouter()
+        q4 = module("q11")
+        unrelated["q11"].forbidden_tokens = q4.forbidden_tokens
+        unrelated["q11"].scrub = q4.scrub
         with patch.dict(sys.modules, {**unrelated, "q10": self.q}):
             main = module("main")
         main._DEBUG_KEY = self.q._Q10_WIRE_KEY
@@ -225,6 +232,8 @@ class TraceTests(unittest.IsolatedAsyncioTestCase):
                                         "incident": {"transcript": "private incident transcript"},
                                         "dispatch": {"arguments": {"service": "svc-private"}}}),
                     "status_code": 200, "duration_ms": 1, "error": None, "response_body": "{}"})
+            for entry in main.LOGS_Q11:
+                main.request_diagnostics.record("q11", main._persistent_debug_entry(entry))
             self.assertEqual((await client.get("/debug/logs/q11", params={"limit": 2})).status_code, 403)
             self.assertEqual((await client.get("/debug/logs/q11", params={"key": main._DEBUG_KEY})).status_code, 403)
             self.assertEqual((await client.get("/debug/logs/q11", headers={"X-Debug-Key": "wrong"})).status_code, 403)

@@ -44,6 +44,7 @@ from fastapi import APIRouter, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from durable_store import connect as storage_connect, initialize, is_shared
 
 # --------------------------------------------------------------- media types
 
@@ -74,20 +75,22 @@ _Q10_WIRE_KEY = os.environ.get("DEBUG_KEY", "")
 
 
 def _q10_wire(kind, body=None, resp=None, task_id=None, batch_id=None, who=None, note=None):
+    if not _Q10_WIRE_KEY:
+        return
     try:
         with _db_lock:
             c = db()
-            c.execute(
+            initialize(c,
                 "CREATE TABLE IF NOT EXISTS q10_wire("
                 " id INTEGER PRIMARY KEY AUTOINCREMENT,"
                 " received REAL, kind TEXT, task_id TEXT, batch_id TEXT,"
-                " who TEXT, note TEXT, body TEXT, resp TEXT)")
+                " who TEXT, note TEXT, body TEXT, resp TEXT);")
             c.execute(
                 "INSERT INTO q10_wire(received,kind,task_id,batch_id,who,note,body,resp)"
                 " VALUES(?,?,?,?,?,?,?,?)",
                 (time.time(), kind, task_id, batch_id, who, note,
-                 json.dumps(body) if body is not None else None,
-                 json.dumps(resp) if resp is not None else None))
+                 json.dumps(_trace_safe(body)) if body is not None else None,
+                 json.dumps(_trace_safe(resp)) if resp is not None else None))
             c.commit()
     except Exception:
         pass
@@ -101,7 +104,7 @@ def _q10_batch_part(message):
 
 # -------------------------------------------------------------- diagnostics
 
-SOLVER_VERSION = "offline-v26"
+SOLVER_VERSION = "offline-v29-shared"
 _TRACE_DB_PATH = os.environ.get("Q10_TRACE_DB", DB_PATH + ".traces")
 _TRACE_BODY_LIMIT = 2 * 1024 * 1024
 _TRACE_STORAGE_LIMIT = 32 * 1024 * 1024
@@ -164,16 +167,12 @@ def _trace_store(event):
             payload_bytes = len(encoded.encode("utf-8"))
             if payload_bytes > _TRACE_STORAGE_LIMIT:
                 raise ValueError("trace metadata exceeds storage budget")
-        parent = os.path.dirname(_TRACE_DB_PATH)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        connection = sqlite3.connect(_TRACE_DB_PATH, timeout=0.25)
+        connection = storage_connect(_TRACE_DB_PATH, timeout=0.25)
         try:
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("CREATE TABLE IF NOT EXISTS http_traces("
-                               "id INTEGER PRIMARY KEY AUTOINCREMENT, received REAL, task_id TEXT, "
-                               "message_id TEXT, status INTEGER, payload TEXT, payload_bytes INTEGER)")
-            connection.execute("CREATE INDEX IF NOT EXISTS trace_task ON http_traces(task_id, id)")
+            initialize(connection, """CREATE TABLE IF NOT EXISTS http_traces(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, received REAL, task_id TEXT,
+                message_id TEXT, status INTEGER, payload TEXT, payload_bytes INTEGER);
+                CREATE INDEX IF NOT EXISTS trace_task ON http_traces(task_id, id);""")
             connection.execute("INSERT INTO http_traces(received,task_id,message_id,status,payload,payload_bytes) "
                                "VALUES(?,?,?,?,?,?)", (event["received"], event.get("taskId"),
                                event.get("messageId"), event["status"], encoded, payload_bytes))
@@ -193,11 +192,15 @@ def _trace_store(event):
 
 
 def _trace_rows(*, before=None, task_id=None, row_id=None, limit=25):
-    if not os.path.isfile(_TRACE_DB_PATH):
+    if not is_shared() and not os.path.isfile(_TRACE_DB_PATH):
         return []
-    connection = sqlite3.connect(_TRACE_DB_PATH, timeout=0.25)
+    connection = storage_connect(_TRACE_DB_PATH, timeout=0.25)
     connection.row_factory = sqlite3.Row
     try:
+        initialize(connection, """CREATE TABLE IF NOT EXISTS http_traces(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, received REAL, task_id TEXT,
+            message_id TEXT, status INTEGER, payload TEXT, payload_bytes INTEGER);
+            CREATE INDEX IF NOT EXISTS trace_task ON http_traces(task_id, id);""")
         clauses, values = [], []
         for column, operator, value in (("id", "<", before), ("task_id", "=", task_id), ("id", "=", row_id)):
             if value is not None:
@@ -282,6 +285,9 @@ class A2ARoute(APIRoute):
             except RequestValidationError:
                 response = err(422, "INVALID_ARGUMENT",
                                "request failed schema validation")
+            except sqlite3.Error:
+                response = err(503, "STORAGE_UNAVAILABLE", "Task storage unavailable; retry the same message")
+                response.headers["Retry-After"] = "1"
             except Exception as exc:
                 if tracing:
                     await _capture_trace(request, raw, error=exc)
@@ -291,6 +297,7 @@ class A2ARoute(APIRoute):
             # well-known agent card is conventionally application/json.
             if "/.well-known/" not in request.url.path:
                 response.headers["content-type"] = A2A_MEDIA_TYPE
+            response.headers["Cache-Control"] = "no-store"
             if tracing:
                 await _capture_trace(request, raw, response=response)
             return response
@@ -311,21 +318,10 @@ _conn = None
 
 def db():
     global _conn
-    if _conn is None:
-        parent = os.path.dirname(DB_PATH)
-        if parent:
-            try:
-                os.makedirs(parent, exist_ok=True)
-            except OSError:
-                pass
-        _conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-        _conn.row_factory = sqlite3.Row
-        try:
-            _conn.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.DatabaseError:
-            pass
-        _conn.execute("PRAGMA synchronous=NORMAL")
-        _conn.executescript(
+    if _conn is None or getattr(_conn, "closed", False):
+        connection = storage_connect(DB_PATH, timeout=30)
+        connection.row_factory = sqlite3.Row
+        initialize(connection,
             """
             CREATE TABLE IF NOT EXISTS q10_tasks (
                 task_id    TEXT PRIMARY KEY,
@@ -352,7 +348,8 @@ def db():
             );
             """
         )
-        _conn.commit()
+        connection.commit()
+        _conn = connection
     return _conn
 
 
@@ -379,6 +376,22 @@ def save_task(task, principal, batch_id):
              task["status"]["state"], json.dumps(task), now, now),
         )
         c.commit()
+
+
+def _task_from_row(row):
+    return (None, None) if row is None else (json.loads(row["doc"]), row["principal"])
+
+
+def _begin_immediate(connection):
+    """Serialize protocol transitions across processes sharing this SQLite file."""
+    connection.execute("BEGIN IMMEDIATE")
+
+
+def _rollback(connection):
+    try:
+        connection.rollback()
+    except sqlite3.Error:
+        pass
 
 
 # ------------------------------------------------------------- helpers
@@ -988,35 +1001,6 @@ def _relationship_rationale(action, facts, current_order, evidence, details, sou
     return lead + " ".join(citations) + suffix
 
 
-def _incomplete_identity_rationale(action, facts, current_order, evidence, details):
-    """Explain the action from controlling relationships without inventing identity."""
-    first, second, third = (f"[{reference}]" for reference in evidence)
-    amount = facts["amountMinor"]
-    currency = facts["currency"]
-    if action == "reject_duplicate":
-        return (f"Action reject_duplicate: {first} establishes the signed current invoice, order, and payable "
-                f"{amount} minor units of {currency}. {second} proves that a prior disbursement settled that same "
-                f"commercial order, not merely a similar amount. {third} prohibits paying an already discharged "
-                "order again.")
-    if action == "open_exception":
-        return (f"Action open_exception: {first} establishes the submitted invoice, current order, and payable "
-                f"{amount} minor units of {currency}. {second} proves that the signed order total conflicts with "
-                f"the submitted invoice and that no corrected invoice exists. {third} requires the exception "
-                "workflow for an unresolved material order/invoice difference.")
-    if action == "hold_invoice":
-        return (f"Action hold_invoice: {first} establishes the signed current invoice, order, and payable "
-                f"{amount} minor units of {currency}. {second} proves that remittance changed and independent "
-                f"verification is still pending. {third} requires payment to remain paused until that verification "
-                "completes.")
-    comparison = "within" if action == "settle_invoice" else "above"
-    consequence = "permits autonomous settlement" if action == "settle_invoice" else "requires a named approver"
-    return (f"Action {action}: {first} establishes signed current order {current_order}, matching received units, "
-            f"and a payable {amount} minor units of {currency}. {second} proves that the recorded payment settled "
-            f"different order {details['paidOrder']}, so this claim is not a duplicate. {third} establishes the "
-            f"{details['limitMinor']} minor-unit authority ceiling; the payable is {comparison} that ceiling, which "
-            f"{consequence}.")
-
-
 def distributed_decision(pkg):
     """Join current invoice/order/ledger/control records instead of their file positions."""
     if cover_facts(pkg) is not None:
@@ -1054,8 +1038,8 @@ def distributed_decision(pkg):
     amount = _money_minor(signed[4] if signed else order[4], currency)
     if amount is None or (order and order[0] != current_order) or (ledger and ledger[4] != current_order):
         return None
-    facts = {"vendorName": ledger[2] if ledger else "unknown",
-             "invoiceNumber": signed[0] if signed else "unknown",
+    facts = {"vendorName": ledger[2] if ledger else signed[2] if signed else "unknown",
+             "invoiceNumber": signed[0] if signed else current_order,
              "amountMinor": amount, "currency": currency}
     disagreement = bool(signed and signed[5])
     if order:
@@ -1090,8 +1074,7 @@ def distributed_decision(pkg):
                    if "ceiling" in components else None)
     details = {"paidOrder": ledger[3] if ledger else None, "limitMinor": limit_minor}
     missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
-    rationale = (_incomplete_identity_rationale(action, facts, current_order, evidence, details)
-                 if missing else _relationship_rationale(action, facts, current_order, evidence, details, sources))
+    rationale = _relationship_rationale(action, facts, current_order, evidence, details, sources)
     return {"action": action, "facts": facts, "evidenceRefs": evidence, "rationale": rationale,
             "unresolvedFacts": missing}
 
@@ -1117,8 +1100,6 @@ def _semantic_invoice_record(text):
         return None
     payee = re.search(r"\b(?:payee|beneficiary|vendor(?: account)?)\s+(?:is\s+)?(.+?)(?=\s+and\s+[A-Z]{3}\s+\d|[,;.]|$)", text, re.I)
     vendor = payee.group(1).strip() if payee else "unknown"
-    if re.fullmatch(r"AC-[A-Z0-9-]+", vendor, re.I):
-        vendor = "unknown"
     return invoices[0].upper(), orders[0].upper(), amounts[0], vendor
 
 
@@ -1216,7 +1197,7 @@ def semantic_distributed_decision(pkg):
     if ledger and ledger[1][3] != current_order:
         return None
     vendor = ledger[1][1] if ledger else invoice[1][3] if invoice else "unknown"
-    invoice_id = invoice[1][0] if invoice else "unknown"
+    invoice_id = invoice[1][0] if invoice else current_order
     if action is None and ledger and ledger[1][2] == current_order:
         if ledger[1][0] != (currency, amount):
             return None
@@ -1250,8 +1231,7 @@ def semantic_distributed_decision(pkg):
     details = {"paidOrder": ledger[1][2] if ledger else None,
                "limitMinor": ceilings[0][1][1] if ceilings else None}
     sources = {ref: text for ref, text, _roles in records}
-    rationale = (_incomplete_identity_rationale(action, facts, current_order, evidence, details)
-                 if missing else _relationship_rationale(action, facts, current_order, evidence, details, sources))
+    rationale = _relationship_rationale(action, facts, current_order, evidence, details, sources)
     return {"action": action, "facts": facts, "evidenceRefs": evidence,
             "rationale": rationale, "unresolvedFacts": missing}
 
@@ -1499,28 +1479,35 @@ async def message_send(request: Request):
     if not isinstance(message_id, str) or not message_id.strip():
         return err(400, "INVALID_ARGUMENT", "message.messageId is required")
 
+    return await asyncio.to_thread(_message_send, who, message,
+                                   getattr(request.state, "q10_decisions", None))
+
+
+def _message_send(who, message, traces):
+    message_id = message["messageId"]
     # Semantic fingerprint over the message only; configuration is ignored.
     fingerprint = sha("q10-msg-v1", who, canonical(message))
 
+    # Dedup applies to initial and continuation messages alike. Reserve initial
+    # messages atomically in start_task; continuations cannot reuse an earlier ID.
     with _db_lock:
         row = db().execute(
             "SELECT fingerprint, task_id FROM q10_msgs WHERE principal=? AND message_id=?",
             (who, message_id)).fetchone()
-    if row and not message.get("taskId"):
+    if row:
         if row["fingerprint"] != fingerprint:
             return err(409, "IDEMPOTENCY_CONFLICT",
                        "messageId already used with different semantic content")
-        task, _ = load_task(row["task_id"])
-        if task:
+        task, owner = load_task(row["task_id"])
+        if task and owner == who:
             return task_envelope(task)
 
     if message.get("taskId"):
-        return await continue_task(who, message, message_id, fingerprint)
-    return await start_task(who, message, message_id, fingerprint,
-                            traces=getattr(request.state, "q10_decisions", None))
+        return continue_task(who, message, message_id, fingerprint)
+    return start_task(who, message, message_id, fingerprint, traces=traces)
 
 
-async def start_task(who, message, message_id, fingerprint, traces=None):
+def start_task(who, message, message_id, fingerprint, traces=None):
     part = find_part(message, MODE_BATCH) or any_data_part(message)
     data = part.get("data") if isinstance(part, dict) else None
     if not isinstance(data, dict):
@@ -1542,67 +1529,98 @@ async def start_task(who, message, message_id, fingerprint, traces=None):
     task_id = "task-" + sha("q10-task-v1", who, fingerprint)[:16]
     context_id = str(batch_id or ("ctx_" + sha("q10-ctx-v1", who, fingerprint)[:24]))
 
-    existing, owner = load_task(task_id)
-    if existing and owner == who:
-        with _db_lock:
-            c = db()
-            c.execute("INSERT OR REPLACE INTO q10_msgs(principal,message_id,fingerprint,task_id)"
-                      " VALUES(?,?,?,?)", (who, message_id, fingerprint, task_id))
-            c.commit()
-        _q10_wire("replay", body=_q10_batch_part(message), task_id=task_id,
-                  batch_id=batch_id, who=who)
-        return task_envelope(existing)
-
-    # Persist SUBMITTED before any decision work.
-    task = {
-        "kind": "task",
-        "id": task_id,
-        "contextId": context_id,
-        "status": {"state": SUBMITTED, "timestamp": now_iso()},
-        "state": SUBMITTED,
-        "history": [message_obj(message, task_id, context_id)],
-        "artifacts": [],
-        "metadata": {"batchId": batch_id, "policyRevision": policy_rev,
-                     "packageCount": len(packages)},
-    }
-    save_task(task, who, batch_id)
+    # One database transaction owns deduplication and construction. BEGIN IMMEDIATE
+    # serializes independent workers that share this file, so no caller can observe
+    # or return a half-built SUBMITTED task.
     with _db_lock:
         c = db()
-        c.execute("INSERT OR REPLACE INTO q10_msgs(principal,message_id,fingerprint,task_id)"
-                  " VALUES(?,?,?,?)", (who, message_id, fingerprint, task_id))
-        c.commit()
+        try:
+            _begin_immediate(c)
+            row = c.execute(
+                "SELECT fingerprint,task_id FROM q10_msgs WHERE principal=? AND message_id=?",
+                (who, message_id)).fetchone()
+            if row:
+                if row["fingerprint"] != fingerprint:
+                    c.rollback()
+                    return err(409, "IDEMPOTENCY_CONFLICT",
+                               "messageId already used with different semantic content")
+                stored = c.execute(
+                    "SELECT doc,principal FROM q10_tasks WHERE task_id=?", (row["task_id"],)).fetchone()
+                c.rollback()
+                existing, owner = _task_from_row(stored)
+                if existing and owner == who:
+                    return task_envelope(existing)
+                return err(409, "INVALID_STATE", "idempotency record has no stored task")
 
-    proposals = []
-    for i, pkg in enumerate(packages):
-        trace = {} if traces is not None else None
-        d = decide(pkg, trace=trace)
-        if trace is not None:
-            if d.get("unresolvedFacts"):
-                trace["incompleteRationaleFormat"] = "concise-bracketed-causal"
-            traces.append(trace)
-        proposals.append({
-            "packageId": ids[i],
-            "actionId": "act_" + sha("q10-action-v1", task_id, ids[i])[:12],
-            "proposalId": "prop_" + sha("q10-prop-v1", task_id, ids[i])[:12],
-            "action": d["action"],
-            "facts": d["facts"],
-            "evidenceRefs": d["evidenceRefs"],
-            "rationale": d["rationale"],
-        })
+            stored = c.execute(
+                "SELECT doc,principal FROM q10_tasks WHERE task_id=?", (task_id,)).fetchone()
+            existing, owner = _task_from_row(stored)
+            if existing:
+                if owner != who:
+                    c.rollback()
+                    return err(404, "TASK_NOT_FOUND", "task not found")
+                c.execute("INSERT INTO q10_msgs(principal,message_id,fingerprint,task_id) VALUES(?,?,?,?)",
+                          (who, message_id, fingerprint, task_id))
+                c.commit()
+                _q10_wire("replay", body=_q10_batch_part(message), task_id=task_id,
+                          batch_id=batch_id, who=who)
+                return task_envelope(existing)
 
-    payload = {"batchId": batch_id, "policyRevision": policy_rev,
-               "proposals": proposals}
-    task["artifacts"] = [make_artifact(
-        "art_" + sha("q10-proposals", task_id)[:24],
-        "invoice-action-proposals", MODE_PROPOSALS, payload)]
-    task["history"].append(agent_message(
-        task_id, context_id,
-        f"Proposed one action for each of {len(proposals)} packages in batch "
-        f"{batch_id}. Awaiting tool receipts before any action is executed.",
-        "proposals"))
-    task["status"] = {"state": INPUT_REQUIRED, "timestamp": now_iso()}
-    task["state"] = INPUT_REQUIRED
-    save_task(task, who, batch_id)
+            task = {
+                "kind": "task",
+                "id": task_id,
+                "contextId": context_id,
+                "status": {"state": SUBMITTED, "timestamp": now_iso()},
+                "state": SUBMITTED,
+                "history": [message_obj(message, task_id, context_id)],
+                "artifacts": [],
+                "metadata": {"batchId": batch_id, "policyRevision": policy_rev,
+                             "packageCount": len(packages)},
+            }
+
+            proposals = []
+            for i, pkg in enumerate(packages):
+                trace = {} if traces is not None else None
+                d = decide(pkg, trace=trace)
+                if trace is not None:
+                    if d.get("unresolvedFacts"):
+                        trace["incompleteRationaleFormat"] = "detailed-source-bound"
+                    traces.append(trace)
+                proposals.append({
+                    "packageId": ids[i],
+                    "actionId": "act_" + sha("q10-action-v1", task_id, ids[i])[:12],
+                    "proposalId": "prop_" + sha("q10-prop-v1", task_id, ids[i])[:12],
+                    "action": d["action"],
+                    "facts": d["facts"],
+                    "evidenceRefs": d["evidenceRefs"],
+                    "rationale": d["rationale"],
+                })
+
+            payload = {"batchId": batch_id, "policyRevision": policy_rev,
+                       "proposals": proposals}
+            task["artifacts"] = [make_artifact(
+                "art_" + sha("q10-proposals", task_id)[:24],
+                "invoice-action-proposals", MODE_PROPOSALS, payload)]
+            task["history"].append(agent_message(
+                task_id, context_id,
+                f"Proposed one action for each of {len(proposals)} packages in batch "
+                f"{batch_id}. Awaiting tool receipts before any action is executed.",
+                "proposals"))
+            task["status"] = {"state": INPUT_REQUIRED, "timestamp": now_iso()}
+            task["state"] = INPUT_REQUIRED
+            now = time.time()
+            c.execute(
+                "INSERT INTO q10_tasks(task_id,principal,context_id,batch_id,state,doc,created,updated)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (task_id, who, context_id, batch_id, INPUT_REQUIRED,
+                 json.dumps(task), now, now))
+            c.execute("INSERT INTO q10_msgs(principal,message_id,fingerprint,task_id) VALUES(?,?,?,?)",
+                      (who, message_id, fingerprint, task_id))
+            c.commit()
+        except Exception:
+            _rollback(c)
+            raise
+
     _q10_wire("send", body=_q10_batch_part(message), resp=payload,
               task_id=task_id, batch_id=batch_id, who=who,
               note="%d packages, policy %s" % (len(packages), policy_rev))
@@ -1611,7 +1629,7 @@ async def start_task(who, message, message_id, fingerprint, traces=None):
 
 # ------------------------------------------------------------ continuation
 
-async def continue_task(who, message, message_id, fingerprint):
+def continue_task(who, message, message_id, fingerprint):
     task_id = str(message.get("taskId"))
     task, owner = load_task(task_id)
     if not task or owner != who:
@@ -1623,21 +1641,15 @@ async def continue_task(who, message, message_id, fingerprint):
     if not isinstance(data, dict) or not isinstance(data.get("results"), list):
         return err(400, "INVALID_ARGUMENT",
                    f"expected a {MODE_RESULTS} part carrying a results array")
+    if str(message.get("contextId") or "") != str(task.get("contextId") or ""):
+        return err(400, "CONTEXT_MISMATCH",
+                   "message contextId does not match the persisted task")
+    expected_batch = str((task.get("metadata") or {}).get("batchId") or "")
+    if str(data.get("batchId") or "") != expected_batch:
+        return err(400, "BATCH_MISMATCH",
+                   "result batchId does not match the persisted task")
 
     results_fp = sha("q10-final-v1", canonical(data))
-    state = task["status"]["state"]
-
-    # Terminal tasks are immutable: only an exact receipt replay is answered,
-    # from persisted state.
-    if state in TERMINAL:
-        with _db_lock:
-            row = db().execute("SELECT results_fp FROM q10_final WHERE task_id=?",
-                               (task_id,)).fetchone()
-        if state == COMPLETED and row and row["results_fp"] == results_fp:
-            return task_envelope(task)
-        return err(409, "TASK_TERMINAL",
-                   f"task is already in {state} and is immutable")
-
     proposals, batch_id = [], task.get("contextId")
     for art in task.get("artifacts") or []:
         for p in art.get("parts") or []:
@@ -1651,10 +1663,15 @@ async def continue_task(who, message, message_id, fingerprint):
     results = data["results"]
     if not results:
         return err(400, "INVALID_ARGUMENT", "results must not be empty")
+    if len(results) != len(proposals):
+        return err(400, "PACKAGE_MISMATCH",
+                   "results must contain exactly one entry for every persisted proposal")
+    result_packages = [str(item.get("packageId") or "") for item in results
+                       if isinstance(item, dict)]
+    if len(result_packages) != len(results) or len(set(result_packages)) != len(result_packages):
+        return err(400, "PACKAGE_MISMATCH", "result packageIds must be unique")
 
-    # Strict all-or-nothing validation. The grader's negative probe carries one
-    # corrupted actionId ("..._wrong"); the whole continuation must be refused
-    # (400) WITHOUT mutating the task.
+    # Strict all-or-nothing validation. Any mismatch refuses the whole batch
     executions = []
     for res in results:
         if not isinstance(res, dict):
@@ -1668,14 +1685,17 @@ async def continue_task(who, message, message_id, fingerprint):
             return err(400, "ACTION_ID_MISMATCH",
                        "result actionId does not match the persisted proposal")
         res_action = res.get("action")
-        if res_action and str(res_action) != prop["action"]:
+        if not isinstance(res_action, str) or res_action != prop["action"]:
             return err(400, "ACTION_MISMATCH",
                        "result action does not match the persisted proposal")
-        outcome = str(res.get("outcome") or "ACCEPTED").upper()
-        nonce = res.get("receiptNonce")
-        if outcome == "ACCEPTED" and not (isinstance(nonce, str) and nonce.strip()):
+        outcome = res.get("outcome")
+        if outcome not in ("ACCEPTED", "REJECTED"):
             return err(400, "INVALID_ARGUMENT",
-                       "an ACCEPTED result requires a receiptNonce")
+                       "result outcome must be ACCEPTED or REJECTED")
+        nonce = res.get("receiptNonce")
+        if not isinstance(nonce, str) or not nonce.strip():
+            return err(400, "INVALID_ARGUMENT",
+                       "every result requires the caller's receiptNonce")
         # Contract: the executions artifact contains ACCEPTED results ONLY.
         # Each one binds the grader's exact receiptNonce and the stored
         # proposal verbatim. Rejected proposals stay in history and are NOT
@@ -1692,47 +1712,71 @@ async def continue_task(who, message, message_id, fingerprint):
                 "evidenceRefs": prop["evidenceRefs"],
             })
 
-    # Finalisation and the cancel race resolve in one synchronous critical
-    # section (no awaits), so exactly one of continuation/cancel wins.
+    # Finalisation and cancellation both take the database write lock before
+    # reading state. Python locks are process-local; BEGIN IMMEDIATE is what makes
+    # the winner unique across independent workers sharing this SQLite file.
     with _db_lock:
         c = db()
-        fresh, owner2 = load_task(task_id)
-        if not fresh or owner2 != who:
-            return err(404, "TASK_NOT_FOUND", "task not found")
-        state = fresh["status"]["state"]
-        if state in TERMINAL:
-            row = c.execute("SELECT results_fp FROM q10_final WHERE task_id=?",
-                            (task_id,)).fetchone()
-            if state == COMPLETED and row and row["results_fp"] == results_fp:
-                return task_envelope(fresh)
-            return err(409, "TASK_TERMINAL",
-                       f"task is already in {state} and is immutable")
-        if state != INPUT_REQUIRED:
-            return err(409, "INVALID_STATE",
-                       f"task is {state}; a continuation requires {INPUT_REQUIRED}")
+        try:
+            _begin_immediate(c)
+            prior = c.execute(
+                "SELECT fingerprint,task_id FROM q10_msgs WHERE principal=? AND message_id=?",
+                (who, message_id)).fetchone()
+            if prior and prior["fingerprint"] != fingerprint:
+                c.rollback()
+                return err(409, "IDEMPOTENCY_CONFLICT",
+                           "messageId already used with different semantic content")
+            row = c.execute(
+                "SELECT doc,principal FROM q10_tasks WHERE task_id=?", (task_id,)).fetchone()
+            fresh, owner2 = _task_from_row(row)
+            if not fresh or owner2 != who:
+                c.rollback()
+                return err(404, "TASK_NOT_FOUND", "task not found")
+            state = fresh["status"]["state"]
+            if state in TERMINAL:
+                row = c.execute("SELECT results_fp FROM q10_final WHERE task_id=?",
+                                (task_id,)).fetchone()
+                if state == COMPLETED and row and row["results_fp"] == results_fp:
+                    if prior is None:
+                        c.execute("INSERT INTO q10_msgs(principal,message_id,fingerprint,task_id) VALUES(?,?,?,?)",
+                                  (who, message_id, fingerprint, task_id))
+                    c.commit()
+                    return task_envelope(fresh)
+                c.rollback()
+                return err(409, "TASK_TERMINAL",
+                           f"task is already in {state} and is immutable")
+            if state != INPUT_REQUIRED:
+                c.rollback()
+                return err(409, "INVALID_STATE",
+                           f"task is {state}; a continuation requires {INPUT_REQUIRED}")
 
-        accepted = len(executions)
-        rejected = max(0, len(results) - accepted)
-        fresh["history"].append(message_obj(message, task_id, fresh["contextId"]))
-        fresh["history"].append(agent_message(
-            task_id, fresh["contextId"],
-            f"Finalised continuation: {len(executions)} tool receipt(s) bound "
-            f"({accepted} executed, {rejected} rejected). Rejected proposals "
-            f"remain on record and were not executed.",
-            "receipts"))
-        fresh["artifacts"].append(make_artifact(
-            "art_" + sha("q10-receipts", task_id)[:24],
-            "invoice-action-receipts", MODE_RECEIPTS,
-            {"batchId": batch_id, "executions": executions}))
-        fresh["status"] = {"state": COMPLETED, "timestamp": now_iso()}
-        fresh["state"] = COMPLETED
+            accepted = len(executions)
+            rejected = max(0, len(results) - accepted)
+            fresh["history"].append(message_obj(message, task_id, fresh["contextId"]))
+            fresh["history"].append(agent_message(
+                task_id, fresh["contextId"],
+                f"Finalised continuation: {len(executions)} tool receipt(s) bound "
+                f"({accepted} executed, {rejected} rejected). Rejected proposals "
+                f"remain on record and were not executed.",
+                "receipts"))
+            fresh["artifacts"].append(make_artifact(
+                "art_" + sha("q10-receipts", task_id)[:24],
+                "invoice-action-receipts", MODE_RECEIPTS,
+                {"batchId": batch_id, "executions": executions}))
+            fresh["status"] = {"state": COMPLETED, "timestamp": now_iso()}
+            fresh["state"] = COMPLETED
 
-        now = time.time()
-        c.execute("UPDATE q10_tasks SET state=?, doc=?, updated=? WHERE task_id=?",
-                  (COMPLETED, json.dumps(fresh), now, task_id))
-        c.execute("INSERT OR REPLACE INTO q10_final(task_id,results_fp) VALUES(?,?)",
-                  (task_id, results_fp))
-        c.commit()
+            now = time.time()
+            c.execute("UPDATE q10_tasks SET state=?, doc=?, updated=? WHERE task_id=?",
+                      (COMPLETED, json.dumps(fresh), now, task_id))
+            c.execute("INSERT INTO q10_final(task_id,results_fp) VALUES(?,?)",
+                      (task_id, results_fp))
+            c.execute("INSERT INTO q10_msgs(principal,message_id,fingerprint,task_id) VALUES(?,?,?,?)",
+                      (who, message_id, fingerprint, task_id))
+            c.commit()
+        except Exception:
+            _rollback(c)
+            raise
     _q10_wire("continue", body={"results": results},
               resp={"executions": executions, "accepted": accepted, "rejected": rejected},
               task_id=task_id, batch_id=batch_id, who=who)
@@ -1743,7 +1787,7 @@ async def continue_task(who, message, message_id, fingerprint):
 
 @router.get("/tasks")
 @router.get("/a2a/tasks")
-async def list_tasks(request: Request):
+def list_tasks(request: Request):
     who, bad = check_headers(request)
     if bad:
         return bad
@@ -1757,7 +1801,7 @@ async def list_tasks(request: Request):
 
 @router.get("/tasks/{task_id}")
 @router.get("/a2a/tasks/{task_id}")
-async def get_task(task_id: str, request: Request):
+def get_task(task_id: str, request: Request):
     who, bad = check_headers(request)
     if bad:
         return bad
@@ -1771,30 +1815,38 @@ async def get_task(task_id: str, request: Request):
 
 @router.post("/tasks/{task_id}:cancel")
 @router.post("/a2a/tasks/{task_id}:cancel")
-async def cancel_task(task_id: str, request: Request):
+def cancel_task(task_id: str, request: Request):
     who, bad = check_headers(request)
     if bad:
         return bad
     with _db_lock:
         c = db()
-        task, owner = load_task(task_id)
-        if not task or owner != who:
-            return err(404, "TASK_NOT_FOUND", "task not found")
-        state = task["status"]["state"]
-        if state in TERMINAL:
-            # Cancel-vs-result race: a completed task is not re-cancelable.
-            return err(409, "TASK_NOT_CANCELABLE",
-                       f"task is already in terminal state {state}")
-        task["status"] = {"state": CANCELED, "timestamp": now_iso()}
-        task["state"] = CANCELED
-        task["history"].append(agent_message(
-            task_id, task.get("contextId", ""),
-            "Task canceled by the owning principal before finalisation; no "
-            "action was executed and no receipt artifact was produced.",
-            "cancel"))
-        c.execute("UPDATE q10_tasks SET state=?, doc=?, updated=? WHERE task_id=?",
-                  (CANCELED, json.dumps(task), time.time(), task_id))
-        c.commit()
+        try:
+            _begin_immediate(c)
+            row = c.execute(
+                "SELECT doc,principal FROM q10_tasks WHERE task_id=?", (task_id,)).fetchone()
+            task, owner = _task_from_row(row)
+            if not task or owner != who:
+                c.rollback()
+                return err(404, "TASK_NOT_FOUND", "task not found")
+            state = task["status"]["state"]
+            if state in TERMINAL:
+                c.rollback()
+                return err(409, "TASK_NOT_CANCELABLE",
+                           f"task is already in terminal state {state}")
+            task["status"] = {"state": CANCELED, "timestamp": now_iso()}
+            task["state"] = CANCELED
+            task["history"].append(agent_message(
+                task_id, task.get("contextId", ""),
+                "Task canceled by the owning principal before finalisation; no "
+                "action was executed and no receipt artifact was produced.",
+                "cancel"))
+            c.execute("UPDATE q10_tasks SET state=?, doc=?, updated=? WHERE task_id=?",
+                      (CANCELED, json.dumps(task), time.time(), task_id))
+            c.commit()
+        except Exception:
+            _rollback(c)
+            raise
     return task_response(task)
 
 
@@ -1836,7 +1888,7 @@ async def q10_trace_detail(trace_id: int, request: Request):
 
 
 @router.get("/debug/q10/wire")
-async def q10_wire_index(request: Request):
+def q10_wire_index(request: Request):
     if not _Q10_WIRE_KEY or request.query_params.get("key") != _Q10_WIRE_KEY:
         return JSONResponse({"error": "forbidden"}, status_code=403)
     try:
@@ -1866,7 +1918,7 @@ async def q10_wire_index(request: Request):
 
 
 @router.get("/debug/q10/wire/{row_id}")
-async def q10_wire_detail(row_id: int, request: Request):
+def q10_wire_detail(row_id: int, request: Request):
     if not _Q10_WIRE_KEY or request.query_params.get("key") != _Q10_WIRE_KEY:
         return JSONResponse({"error": "forbidden"}, status_code=403)
     with _db_lock:

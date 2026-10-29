@@ -158,8 +158,8 @@ class OfflineLiveRegressions(unittest.TestCase):
     def test_distributed_invoice_records_are_order_independent(self):
         expected = {
             "duplicate": ("reject_duplicate", "INV-TEST-1", "Example Supplier", []),
-            "settle_missing_invoice": ("settle_invoice", "unknown", "Example Supplier", ["invoiceNumber"]),
-            "exception": ("open_exception", "INV-TEST-3", "unknown", ["vendorName"]),
+            "settle_missing_invoice": ("settle_invoice", "PO-TEST-2", "Example Supplier", []),
+            "exception": ("open_exception", "INV-TEST-3", "AC-333", []),
         }
         for case, values in expected.items():
             pkg = package(case)
@@ -201,7 +201,7 @@ class OfflineLiveRegressions(unittest.TestCase):
                 self.assertEqual(replay.json(), final.json())
         asyncio.run(exercise())
 
-    def test_invoice_incomplete_rationale_is_stable_across_batch_order(self):
+    def test_invoice_source_backed_identity_is_stable_across_batch_order(self):
         async def exercise():
             app = FastAPI()
             app.include_router(q10.router)
@@ -221,11 +221,13 @@ class OfflineLiveRegressions(unittest.TestCase):
                 proposals = response.json()["task"]["artifacts"][0]["parts"][0]["data"]["proposals"]
                 baseline = q10.decide(packages[0])
                 self.assertTrue(all(proposal["rationale"] == baseline["rationale"] for proposal in proposals))
-                self.assertTrue(all(proposal["facts"]["invoiceNumber"] == "unknown" for proposal in proposals))
+                self.assertTrue(all(proposal["facts"]["invoiceNumber"] == "PO-TEST-2" for proposal in proposals))
                 self.assertTrue(all(proposal["action"] == "settle_invoice" for proposal in proposals))
+                self.assertEqual(baseline["unresolvedFacts"], [])
                 self.assertNotIn("Missing source fields", baseline["rationale"])
                 for reference in baseline["evidenceRefs"]:
-                    self.assertEqual(baseline["rationale"].count("[" + reference + "]"), 1)
+                    self.assertEqual(baseline["rationale"].count(reference), 1)
+                    self.assertNotIn("[" + reference + "]", baseline["rationale"])
         asyncio.run(exercise())
 
     def test_public_diagnostics_redact_private_content_and_wire_details_require_key(self):

@@ -4,13 +4,19 @@ A single FastAPI deployment for the assignment endpoints. The Q2–Q4 agent path
 
 ## Offline decision model
 
-- **Invoice/A2A:** extracts current commercial identities, amounts, order/payment relationships, authority ceilings, bank verification, and exactly three controlling references. It supports both the ordinary cover/ledger layout and distributed/paraphrased records independent of file order. When a distributed record omits a distinct invoice number or human-readable vendor, that field remains `unknown` rather than being invented. The evidence-backed action still follows the signed order/invoice, current ledger, verification state, and authority boundary.
+- **Invoice/A2A:** extracts current commercial identities, amounts, order/payment relationships, authority ceilings, bank verification, and exactly three controlling references. It supports both the ordinary cover/ledger layout and distributed/paraphrased records independent of file order. If a distinct invoice number or human-readable vendor is absent, it uses the concrete controlling order/payee identifier when supplied; truly unsupported identities remain explicit rather than invented. Actions follow the signed commercial records, current ledger, verification state, and authority boundary.
 - **Mailroom:** selects actions from source kind, provenance, current authenticated state, signed scope, exact request identity, and least privilege. Standing approvals and request-controlled notices are handled separately. Contradictory or unsupported evidence returns HTTP 422 without a model call.
 - **Incident response:** classifies unique positive causal relations, validates catalog-bound arguments, evaluates bounded numeric/Boolean operating rules, enforces approval gates, and persists receipt-driven state and OTLP topology.
 
 The solver is designed to generalize through entities and relationships rather than fixed generated IDs. Arbitrary natural-language input can still be ambiguous; those cases fail closed instead of being guessed.
 
-Incomplete Q2 audit packages use one stable concise rationale: each exact evidence ID is bracket-cited once, the action follows an explicit causal chain, raw evidence paragraphs are not repeated, and the absent identity is not discussed in the explanation. Facts retain the documented `unknown` marker rather than inventing source data; complete packages and previously accepted proposals remain unchanged.
+Incomplete Q2 audit packages use the concrete commercial identifiers supplied by their controlling records: the signed current order when no distinct invoice identifier is present, and the signed payee when no human-readable vendor is present. Rationale excerpts are source-bound; a source-presence check is not proof of a hidden grader's expected answer.
+
+## Vercel
+
+Follow [VERCEL.md](VERCEL.md). **Q2/Q4 require shared PostgreSQL on Vercel**, configured with `SOLVER_DATABASE_URL` (or `POSTGRES_URL` / `DATABASE_URL`). Local SQLite is retained for development but is refused for Q2/Q4 when `VERCEL=1` without shared storage. Q3's implementation is unchanged.
+
+The repository includes the Python 3.12 runtime selection, PostgreSQL driver, no-cache headers, and a 60-second function limit. Check `/health/ready` before another grader attempt. No database credentials, Vercel deployment, or grader Check are performed by local tests.
 
 ## Render
 
@@ -28,7 +34,8 @@ No provider API key is required for Q2–Q4.
 
 ## Health and diagnostics
 
-- `/health` — readiness and version (`offline-v26`)
+- `/health` — configuration status and version (`offline-v29-shared`)
+- `/health/ready` — verifies the database connection; returns 503 when unavailable
 - `/debug/q9` — redacted durable Q3 proposal records
 - `/debug/q9/commitwire` — redacted Q3 receipt/outcome records
 - `/debug/q10` — redacted recent Q2 HTTP records
@@ -51,7 +58,7 @@ Captures include solver version, HTTP status and duration, request/response JSON
 
 New decisions include parser-attempt results, facts and source-presence locations, controlling evidence text, order/payment relationships, bank verification, authority calculations, and unresolved-field warnings. Source presence is diagnostic evidence, not proof that a hidden grader accepts a fact. Replay requests refer to the original task and do not recompute its decisions. Continuations retain the actual grader outcomes without treating a rejected proposal as an execution.
 
-The trace database is separate from task state. Retention is bounded by 500 rows and 32 MiB of serialized payloads. An individual event exceeding that budget is reduced to metadata and marked `event_size_limit`. Capture failures do not change protocol responses; the index reports `captureFailures` and `lastCaptureError`. Diagnostic reads do not create more traces. Export before redeploying: an ephemeral filesystem does not retain them across deployments.
+The trace database is separate from local task state; with PostgreSQL it uses separate tables in the shared database. Retention is bounded by 500 rows and 32 MiB of serialized payloads. An individual event exceeding that budget is reduced to metadata and marked `event_size_limit`. Capture failures do not change protocol responses; the index reports process-local `captureFailures` and `lastCaptureError`. Diagnostic reads do not create more traces. PostgreSQL traces persist across function instances and app deployments; local SQLite traces do not survive an ephemeral-host redeployment. Export before retention evicts important evidence.
 
 To export after a Check, set `DEBUG_KEY` in the local terminal environment to the same secret, then run from this repository:
 
@@ -72,11 +79,9 @@ The analysis preserves each rejected proposal's parser, facts, evidence, rationa
 ## Verification
 
 ```powershell
-python -I -B test_q10_evidence.py
-python -I -B test_q10_traces.py
-python -I -B test_capture_q2_traces.py
-python -I -B test_analyze_q2_traces.py
-python -I -B test_live_offline_regressions.py
+python -I -B run_local_tests.py
 ```
+
+The runner uses separate processes and temporary state, supplies a local diagnostic key, and clears deployment database credentials. Real PostgreSQL worker/race tests and the two-instance HTTP smoke test are described in [VERCEL.md](VERCEL.md).
 
 Additional replay suites live in the adjacent `ga5-src` workspace. They verify signed receipts, stable accepted outputs, receipt conflict handling, invoice audit cases, incident retries/approvals/timeouts, trace topology, and persisted replay.

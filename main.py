@@ -13,6 +13,11 @@ import time
 import httpx
 from typing import List, Dict, Any, Optional
 from collections import deque
+import asyncio
+import sqlite3
+import request_diagnostics
+from durable_store import storage_status, connect as storage_connect
+from q11 import forbidden_tokens, scrub
 
 # Import Q8 - Q11 routers
 from q8 import router as q8_router
@@ -101,6 +106,41 @@ def _debug_authorized(request: Request) -> bool:
     return bool(_DEBUG_KEY and supplied and hmac.compare_digest(
         supplied.encode("utf-8"), _DEBUG_KEY.encode("utf-8")))
 
+def _persistent_debug_entry(entry):
+    result = _safe_debug_entry(entry, diagnostic_access=True)
+    try:
+        body = json.loads(entry.get("body") or "{}")
+        forbidden = forbidden_tokens(body) if isinstance(body, dict) else []
+    except (ValueError, TypeError):
+        forbidden = []
+    for field in ("body", "response_body"):
+        if result.get(field):
+            try:
+                result[field] = json.dumps(scrub(json.loads(result[field]), forbidden), ensure_ascii=False)
+            except (ValueError, TypeError):
+                result[field] = "[REDACTED invalid JSON]"
+    for field in ("headers", "url", "error"):
+        if field in result:
+            result[field] = scrub(result[field], forbidden)
+    return result
+
+
+def _question_diagnostics(path):
+    if path.startswith("/debug"):
+        return None
+    if "/a2a" in path or path.startswith(("/tasks", "/message:send")) or "agent-card" in path:
+        return "q10"
+    if path.startswith("/v2/incidents") or "/q11" in path:
+        return "q11"
+    return None
+
+
+async def _persist_request_log(request, entry):
+    question = _question_diagnostics(request.url.path)
+    if question:
+        await asyncio.to_thread(request_diagnostics.record, question, _persistent_debug_entry(entry))
+
+
 # ==============================================================================
 # Middleware for Request Logging and Route-Based Log Partitioning
 # ==============================================================================
@@ -147,6 +187,7 @@ async def log_requests(request: Request, call_next):
             LOGS_Q11.append(log_entry)
         else:
             LOGS_MAIN.append(log_entry)
+        await _persist_request_log(request, log_entry)
         raise e
 
     duration = round((time.time() - start_time) * 1000, 2)
@@ -208,6 +249,9 @@ async def log_requests(request: Request, call_next):
     else:
         LOGS_MAIN.append(log_entry)
         
+    if _question_diagnostics(path):
+        response.headers["Cache-Control"] = "no-store"
+    await _persist_request_log(request, log_entry)
     print(f"LOG: {request.method} {request.url.path} -> {log_entry['status_code']} ({log_entry['duration_ms']}ms)", flush=True)
     return response
 
@@ -238,9 +282,11 @@ def get_q9_debug_logs():
 @app.get("/debug/logs/q10")
 def get_q10_debug_logs(limit: int = 25, before: Optional[float] = None):
     limit = max(1, min(limit, 100))
-    rows = [entry for entry in LOGS_Q10
-            if before is None or float(entry.get("timestamp", 0)) < before]
-    return [_safe_debug_entry(entry) for entry in rows[-limit:]]
+    try:
+        rows = request_diagnostics.rows("q10", limit=limit, before=before)
+    except sqlite3.Error:
+        raise HTTPException(status_code=503, detail="Diagnostic storage unavailable")
+    return [_safe_debug_entry(entry) for entry in rows]
 
 @app.get("/debug/q11")
 @app.get("/debug/logs/q11")
@@ -248,9 +294,11 @@ def get_q11_debug_logs(request: Request, limit: int = 25, before: Optional[float
     if not _debug_authorized(request):
         raise HTTPException(status_code=403, detail="Forbidden")
     limit = max(1, min(limit, 100))
-    rows = [entry for entry in LOGS_Q11
-            if before is None or float(entry.get("timestamp", 0)) < before]
-    return [_safe_debug_entry(entry, diagnostic_access=True) for entry in rows[-limit:]]
+    try:
+        rows = request_diagnostics.rows("q11", limit=limit, before=before)
+    except sqlite3.Error:
+        raise HTTPException(status_code=503, detail="Diagnostic storage unavailable")
+    return [_safe_debug_entry(entry, diagnostic_access=True) for entry in rows]
 
 # ==============================================================================
 # Helper functions & Startup Config
@@ -344,7 +392,30 @@ def read_root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": SOLVER_VERSION}
+    storage = storage_status()
+    result = {"status": "ok" if storage["configured"] else "configuration_required",
+              "version": SOLVER_VERSION, "storage": storage}
+    if not storage["configured"]:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(result, status_code=503)
+    return result
+
+
+@app.get("/health/ready")
+def readiness():
+    storage = storage_status()
+    if not storage["configured"]:
+        raise HTTPException(status_code=503, detail="Shared PostgreSQL is required on Vercel")
+    connection = None
+    try:
+        connection = storage_connect(os.environ.get("SOLVER_LOG_DB", "/tmp/ga5_http_logs.db"))
+        connection.execute("SELECT 1").fetchone()
+    except sqlite3.Error:
+        raise HTTPException(status_code=503, detail="Storage unavailable")
+    finally:
+        if connection is not None:
+            connection.close()
+    return {"status": "ready", "version": SOLVER_VERSION, "storage": storage}
 
 # ==============================================================================
 # Q2 - Spec-Driven Development: The Proration Bug

@@ -33,8 +33,24 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
+from durable_store import connect as storage_connect, initialize
 
-router = APIRouter()
+
+class IncidentRoute(APIRoute):
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def handler(request):
+            try:
+                return await original(request)
+            except sqlite3.Error:
+                return JSONResponse({"detail": "Incident storage unavailable"}, status_code=503,
+                                    headers={"Retry-After": "1", "Cache-Control": "no-store"})
+        return handler
+
+
+router = APIRouter(route_class=IncidentRoute)
 
 # runId -> full persisted state
 INCIDENTS: Dict[str, Dict[str, Any]] = {}
@@ -66,24 +82,20 @@ def _debug_safe(value: Any) -> Any:
     return value
 
 
-def _q11_state_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(_Q11_WIRE_DB, timeout=10.0, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("CREATE TABLE IF NOT EXISTS q11_runs("
-                 " run_id TEXT PRIMARY KEY, state TEXT NOT NULL)")
+def _q11_state_connect():
+    conn = storage_connect(_Q11_WIRE_DB, timeout=10.0)
+    initialize(conn, "CREATE TABLE IF NOT EXISTS q11_runs("
+                    " run_id TEXT PRIMARY KEY, state TEXT NOT NULL);")
     return conn
 
 
-def _q11_wire_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(_Q11_WIRE_DB, timeout=10.0, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute(
+def _q11_wire_connect():
+    conn = storage_connect(_Q11_WIRE_DB, timeout=10.0)
+    initialize(conn,
         "CREATE TABLE IF NOT EXISTS q11_wire("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " received REAL, kind TEXT, run_id TEXT, note TEXT,"
-        " body TEXT, resp TEXT)")
+        " body TEXT, resp TEXT);")
     return conn
 
 
@@ -108,7 +120,7 @@ def _load_incident(run_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _persist_incident(state: Dict[str, Any], expected: Optional[Dict[str, Any]] = None) -> bool:
-    """Persist state. With expected, update only the exact state previously read."""
+    """Create once or compare-and-swap an existing state revision."""
     run_id = state.get("runId")
     if not isinstance(run_id, str) or not run_id:
         raise HTTPException(status_code=500, detail="Incident state has no runId")
@@ -117,9 +129,12 @@ def _persist_incident(state: Dict[str, Any], expected: Optional[Dict[str, Any]] 
         conn = _q11_state_connect()
         try:
             if expected is None:
-                conn.execute("INSERT OR REPLACE INTO q11_runs(run_id,state) VALUES(?,?)",
-                             (run_id, blob))
-                changed = True
+                try:
+                    conn.execute("INSERT INTO q11_runs(run_id,state) VALUES(?,?)",
+                                 (run_id, blob))
+                    changed = True
+                except sqlite3.IntegrityError:
+                    changed = False
             else:
                 cursor = conn.execute(
                     "UPDATE q11_runs SET state=? WHERE run_id=? AND state=?",
@@ -216,7 +231,7 @@ _REDACTED = "[redacted]"
 # arguments", ...) rather than secret literals, so redacting them is normally a
 # no-op on our output, but including them costs nothing and closes the last
 # redaction-discipline gap vs. the uncapped reference.
-_MIN_FORBIDDEN_LEN = 4
+_MIN_FORBIDDEN_LEN = 1
 
 
 def _collect_strings(obj: Any, out: List[str]) -> None:
@@ -259,8 +274,13 @@ def scrub(obj: Any, forbidden: List[str]) -> Any:
     if isinstance(obj, str):
         s = obj
         for tok in forbidden:  # longest-first
-            if tok in s:
+            if len(tok) >= 4:
                 s = s.replace(tok, _REDACTED)
+            elif s == tok:
+                s = _REDACTED
+            else:
+                s = re.sub(r"(?<![A-Za-z0-9])" + re.escape(tok)
+                           + r"(?![A-Za-z0-9])", _REDACTED, s)
         return s
     if isinstance(obj, dict):
         return {k: scrub(v, forbidden) for k, v in obj.items()}
@@ -433,7 +453,9 @@ def _causal_lines(transcript: str) -> List[Tuple[str, str]]:
 
 
 # Concrete-artifact parsers (best-effort, deterministic) --------------------- #
-_RELEASE_RE = re.compile(r"\b(r\d+-[A-Za-z0-9]+|d-\d+|v\d+\.\d+\.\d+)\b")
+_RELEASE_RE = re.compile(
+    r"\b(r\d+-[A-Za-z0-9]+|d-\d+|v\d+\.\d+\.\d+|deploy[-_][A-Za-z0-9]+)\b",
+    re.I)
 # Context words marking a release as the KNOWN-GOOD rollback target vs the
 # regressed release that must NOT be the rollback target. Rolling back means
 # reverting TO the previous healthy release — targeting the broken release is a
@@ -448,7 +470,7 @@ _BAD_CTX = ("malformed", "regression", "regressed", "errors", "error", "failing"
             "seconds of release", "after release")
 
 
-_CLAUSE_SPLIT = re.compile(r"[\n;]+|\.(?:\s+|$)")
+_CLAUSE_SPLIT = re.compile(r"[\n;]+|\.(?:\s+|$)|,?\s+\b(?:while|whereas|but)\b\s+")
 
 
 def _parse_release(text: str) -> Optional[str]:
@@ -463,18 +485,13 @@ def _parse_release(text: str) -> Optional[str]:
     no release id) fall back sensibly."""
     tokens = [m.group(1) for m in _RELEASE_RE.finditer(text)]
     if not tokens:
-        m = re.search(r"\bdeploy[-_ ]?([A-Za-z0-9]+)\b", text, re.I)
-        return ("deploy-" + m.group(1)) if m else None
+        return None
     # distinct releases, preserving first-seen order
     distinct: List[str] = []
     for t in tokens:
         if t not in distinct:
             distinct.append(t)
-    if len(distinct) == 1:
-        return distinct[0]
-
     clauses = [c for c in _CLAUSE_SPLIT.split(text) if c.strip()]
-    last_pos = {r: text.rfind(r) for r in distinct}
 
     def rel_score(rel: str) -> int:
         good = bad = 0
@@ -487,9 +504,12 @@ def _parse_release(text: str) -> Optional[str]:
             bad += sum(failure_text.count(b) for b in _BAD_CTX)
         return good - bad
 
-    # Best good-minus-bad context wins; tie-break prefers the later-mentioned id
-    # (revert targets are usually named after the culprit).
-    return max(distinct, key=lambda r: (rel_score(r), last_pos[r]))
+    # A destructive rollback requires an observed known-good target. A lone ID
+    # described only as active/broken is the culprit, not a safe destination.
+    scores = {release: rel_score(release) for release in distinct}
+    best = max(scores.values())
+    winners = [release for release, score in scores.items() if score == best]
+    return winners[0] if best > 0 and len(winners) == 1 else None
 
 
 def _parse_int(text: str, default: int) -> int:
@@ -506,14 +526,23 @@ def _parse_int(text: str, default: int) -> int:
 
 
 def _parse_flag(text: str) -> Optional[str]:
-    # Prefer a real flag identifier token (flag_xxxx / xxx_flag / flagXxxx),
-    # e.g. 'flag_thhtb36vrp'. Only fall back to a loose 'flag <word>' phrase.
-    m = re.search(r"\b(flag_[A-Za-z0-9]+|[A-Za-z0-9]+_flag|flag[A-Za-z0-9]{4,})\b",
-                  text, re.I)
-    if m:
-        return m.group(1)
-    m = re.search(r"\bflag[-_ ]?([A-Za-z0-9]+)\b", text, re.I)
-    return ("flag_" + m.group(1)) if m else None
+    pattern = re.compile(r"\b(flag_[A-Za-z0-9_-]+|[A-Za-z0-9_]+_flag|flag[A-Z][A-Za-z0-9]{3,})\b")
+    scores = {}
+    for clause in _CLAUSE_SPLIT.split(text):
+        low = clause.lower()
+        causal = re.sub(r"\b(?:no|without) (?:matching )?(?:recursion|recursive evaluation|errors?)\b", "", low)
+        positive = bool(re.search(
+            r"recurs|evaluation depth|evaluation loop|stack overflow|depth guard|"
+            r"loop(?:s|ing)? through .*evaluation|disabled.*completes normally", causal))
+        healthy = bool(re.search(r"healthy|unaffected|no recursion|without recursion", low))
+        for match in pattern.finditer(clause):
+            flag = match.group(1)
+            scores[flag] = scores.get(flag, 0) + int(positive) - int(healthy)
+    if not scores:
+        return None
+    best = max(scores.values())
+    winners = [flag for flag, score in scores.items() if score == best]
+    return winners[0] if best > 0 and len(winners) == 1 else None
 
 
 def _parse_dependency(text: str) -> Optional[str]:
@@ -671,11 +700,9 @@ def _choose_effect(root_cause: str, effect_tools: List[str], approval_tools: set
     for safe in ("open_incident", "scale_service", "page_owner"):
         if avail(safe) and safe not in approval_tools:
             return safe
-    # Last resort: any non-approval effect tool.
-    for name in effect_tools:
-        if name not in approval_tools and name != "no_action":
-            return name
-    return effect_tools[0] if effect_tools else None
+    if "no_action" in effect_tools and "no_action" not in approval_tools:
+        return "no_action"
+    return None
 
 
 def _offline_observations(incident: Dict[str, Any]) -> List[Tuple[str, str]]:
@@ -963,8 +990,9 @@ def _validate_offline_plan(decision: Dict[str, Any], incident: Dict[str, Any],
         raise HTTPException(status_code=422, detail="Unsupported diagnostic plan")
     tools = [step.get("toolName") for step in diagnostics]
     effects = set(policy.get("effectTools") or [])
-    approval_tools = set(policy.get("approvalRequiredFor", DEFAULT_APPROVAL_TOOLS) or [])
-    if len(tools) != len(set(tools)) or any(tool in effects or tool in approval_tools for tool in tools):
+    approval_tools = set(policy.get("approvalRequiredFor") or []) | set(DEFAULT_APPROVAL_TOOLS)
+    known_effects = {plan["effect"] for plan in _REF_PLAN.values()} | {"no_action"}
+    if len(tools) != len(set(tools)) or any(tool in effects | approval_tools | known_effects for tool in tools):
         raise HTTPException(status_code=422, detail="Invalid diagnostic tools")
     effect = decision.get("effect")
     if effect is not None and effect.get("toolName") not in effects:
@@ -1033,7 +1061,7 @@ def heuristic_decision(incident: Dict[str, Any], policy: Dict[str, Any],
     operating_rules = _operating_rules(signal_raw, root_cause)
 
     effect_tools = policy.get("effectTools", []) or []
-    approval_tools = set(policy.get("approvalRequiredFor", DEFAULT_APPROVAL_TOOLS) or [])
+    approval_tools = set(policy.get("approvalRequiredFor") or []) | set(DEFAULT_APPROVAL_TOOLS)
     max_diag = policy.get("maximumDiagnostics", 3)
     if type(max_diag) is not int or not 1 <= max_diag <= 3:
         raise HTTPException(status_code=422, detail="maximumDiagnostics must be between 1 and 3")
@@ -1122,8 +1150,9 @@ def heuristic_decision(incident: Dict[str, Any], policy: Dict[str, Any],
             })
     else:
         # Fallback: affinity-scored selection (audit / unrecognised cause).
+        known_effects = {plan["effect"] for plan in _REF_PLAN.values()} | {"no_action"}
         diag_tools = [t for t in catalog
-                      if t.get("name") not in effect_tools and t.get("name") not in approval_tools]
+                      if t.get("name") not in set(effect_tools) | approval_tools | known_effects]
 
         def tool_score(t: Dict[str, Any]) -> int:
             kws = set(_tokens(t.get("name", "")) + _tokens(t.get("description", "")))
@@ -1146,12 +1175,13 @@ def heuristic_decision(incident: Dict[str, Any], policy: Dict[str, Any],
     #     ('runbook requires paging the service owner rather than raising the
     #     scaling ceiling') outranks the canonical cause->effect plan. Core cases
     #     carry no such phrasing, so their (already-green) plans are untouched.
-    if runbook_effect and runbook_effect in effect_tools:
-        plan_effect_name = runbook_effect
-    if operating_rules.get("effect") in effect_tools:
-        plan_effect_name = operating_rules["effect"]
-    if operating_rules.get("on_diagnostic_timeout") and "page_owner" in effect_tools:
-        plan_effect_name = "page_owner"
+    prescribed = operating_rules.get("effect") or runbook_effect
+    if operating_rules.get("on_diagnostic_timeout"):
+        prescribed = "page_owner"
+    if prescribed:
+        if prescribed not in effect_tools or prescribed not in catalog_names:
+            raise HTTPException(status_code=422, detail="Required runbook effect is unavailable")
+        plan_effect_name = prescribed
 
     # 5. Effect — reference plan first, else cause-mapped safe/destructive choice.
     effect = None
@@ -1160,6 +1190,13 @@ def heuristic_decision(incident: Dict[str, Any], policy: Dict[str, Any],
     else:
         chosen_effect_name = _choose_effect(root_cause, effect_tools, approval_tools,
                                             release=release, flag=flag)
+    # Reference plans describe the tool family, not authority to invent its target.
+    # If the current evidence does not identify a known-good release or exact flag,
+    # fall back to a non-destructive catalog action.
+    if ((chosen_effect_name == "rollback_deployment" and not release)
+            or (chosen_effect_name == "disable_feature" and not flag)):
+        chosen_effect_name = _choose_effect(root_cause, effect_tools, approval_tools,
+                                            release=None, flag=None)
     chosen_effect = next((t for t in catalog if t.get("name") == chosen_effect_name), None)
     if chosen_effect:
         effect = {
@@ -1582,7 +1619,10 @@ async def create_incident(request: Request):
         raise HTTPException(status_code=422, detail="Invalid JSON body")
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="JSON body must be an object")
+    return await asyncio.to_thread(_create_incident, body, request.headers)
 
+
+def _create_incident(body, headers):
     if body.get("profile") != PROFILE:
         raise HTTPException(status_code=422, detail="Unsupported profile")
     run_id = body.get("runId")
@@ -1622,7 +1662,10 @@ async def create_incident(request: Request):
     if scrub(decision, forbidden) != decision:
         raise HTTPException(status_code=422, detail="Plan contains prohibited private material")
 
-    inc_tid, inc_sid, inc_ts = parse_incoming_traceparent(request.headers)
+    inc_tid, inc_sid, inc_ts = parse_incoming_traceparent(headers)
+    if inc_ts and (len(inc_ts) > 512 or scrub(inc_ts, forbidden) != inc_ts
+                   or any(ord(char) < 32 or ord(char) > 126 for char in inc_ts)):
+        raise HTTPException(status_code=422, detail="Invalid or prohibited trace context")
     trace_id = inc_tid or trace_id_for(run_id)
 
     state: Dict[str, Any] = {
@@ -1693,8 +1736,15 @@ async def create_incident(request: Request):
         # grader never posts receipts, so a waiting run would score zero.
         resp = _self_complete(state)
         state["first_response"] = resp
+        if not _persist_incident(state):
+            winner = _incident(run_id)
+            if winner is None or winner.get("req_fp") != req_fp:
+                raise HTTPException(status_code=409, detail="runId content conflict")
+            if winner["status"] in ("completed", "failed"):
+                return JSONResponse(winner["final_result"], headers=trace_response_headers(winner))
+            return JSONResponse(winner.get("last_response", winner["first_response"]),
+                                headers=trace_response_headers(winner))
         INCIDENTS[run_id] = state
-        _persist_incident(state)
         _q11_wire("create_selfcomplete", run_id=run_id, body=body, resp=resp,
                   note="rootCause=%s diag=%d effect=%s" % (
                       decision.get("rootCause", ""),
@@ -1704,8 +1754,15 @@ async def create_incident(request: Request):
 
     resp = waiting_response(state, dispatches, [])
     state["first_response"] = resp
+    if not _persist_incident(state):
+        winner = _incident(run_id)
+        if winner is None or winner.get("req_fp") != req_fp:
+            raise HTTPException(status_code=409, detail="runId content conflict")
+        if winner["status"] in ("completed", "failed"):
+            return JSONResponse(winner["final_result"], headers=trace_response_headers(winner))
+        return JSONResponse(winner.get("last_response", winner["first_response"]),
+                            headers=trace_response_headers(winner))
     INCIDENTS[run_id] = state
-    _persist_incident(state)
     _q11_wire("create", run_id=run_id, body=body,
               resp={"status": resp.get("status"),
                     "diagnosis": decision,
@@ -1722,7 +1779,7 @@ async def create_incident(request: Request):
 # GET /v2/incidents/{runId}
 # --------------------------------------------------------------------------- #
 @router.get("/v2/incidents/{run_id}")
-async def get_incident(run_id: str):
+def get_incident(run_id: str):
     state = _incident(run_id)
     if not state:
         raise HTTPException(status_code=404, detail="Unknown runId")
@@ -1890,6 +1947,10 @@ async def post_receipt(run_id: str, request: Request):
         raise HTTPException(status_code=422, detail="Invalid JSON body")
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="JSON body must be an object")
+    return await asyncio.to_thread(_post_receipt, run_id, body)
+
+
+def _post_receipt(run_id, body):
     receipt_id = body.get("receiptId")
     if not isinstance(receipt_id, str) or not receipt_id:
         raise HTTPException(status_code=422, detail="Missing receiptId")
@@ -2058,7 +2119,7 @@ def _handle_approvals(state: Dict[str, Any], receipt_id: str,
 # v3 debug wire (not part of grading): key-gated capture browser               #
 # --------------------------------------------------------------------------- #
 @router.get("/debug/q11/wire")
-async def q11_wire_index(request: Request):
+def q11_wire_index(request: Request):
     global _q11_wire_conn
     if not _Q11_WIRE_KEY or request.query_params.get("key") != _Q11_WIRE_KEY:
         return JSONResponse({"error": "forbidden"}, status_code=403)
@@ -2090,7 +2151,7 @@ async def q11_wire_index(request: Request):
 
 
 @router.get("/debug/q11/wire/{row_id}")
-async def q11_wire_detail(row_id: int, request: Request):
+def q11_wire_detail(row_id: int, request: Request):
     if not _Q11_WIRE_KEY or request.query_params.get("key") != _Q11_WIRE_KEY:
         return JSONResponse({"error": "forbidden"}, status_code=403)
     with _q11_wire_lock:

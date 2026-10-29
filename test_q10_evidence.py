@@ -50,16 +50,11 @@ class InvoiceEvidenceTests(unittest.TestCase):
         self.assertLessEqual(len(rationale), 1500)
         self.assertIn("Action " + decision["action"], rationale)
         self.assertEqual(decision["evidenceRefs"], ["R_SOURCE0", "R_SOURCE1", "R_SOURCE2"])
-        unresolved = bool(decision.get("unresolvedFacts"))
         for doc in package["documents"][:3]:
             ref, text = doc["text"].split("] ", 1)
             ref = ref[1:]
             self.assertEqual(rationale.count(ref), 1)
-            if unresolved:
-                self.assertIn(f"[{ref}]", rationale)
-                self.assertNotIn(text, rationale)
-            else:
-                self.assertIn(f'{ref}: "{text}".', rationale)
+            self.assertIn(f'{ref}: "{text}".', rationale)
         self.assertNotIn("R_DECOY00", rationale)
 
     def test_each_action_cites_actual_sources(self):
@@ -78,10 +73,10 @@ class InvoiceEvidenceTests(unittest.TestCase):
         decision = q10.decide(package)
         self.assertEqual(decision["action"], "request_approval")
         self.assert_citations(package, decision)
-        self.assertNotIn("callback", decision["rationale"])
-        self.assertNotIn("account", decision["rationale"])
-        self.assertIn("[R_SOURCE2] establishes the 19999 minor-unit authority ceiling", decision["rationale"])
-        self.assertIn("above that ceiling", decision["rationale"])
+        ceiling_citation = decision["rationale"].split('R_SOURCE2: "', 1)[1].split('".', 1)[0]
+        self.assertNotIn("callback", ceiling_citation)
+        self.assertNotIn("account", ceiling_citation)
+        self.assertIn("above the 19999 minor-unit ceiling", decision["rationale"])
 
     def test_authority_boundary_includes_equality(self):
         for ceiling, expected in (("199.99", "request_approval"), ("200.00", "settle_invoice"), ("200.01", "settle_invoice")):
@@ -89,19 +84,17 @@ class InvoiceEvidenceTests(unittest.TestCase):
                 decision = q10.decide(invoice_package(ceiling=ceiling))
                 self.assertEqual(decision["action"], expected)
 
-    def test_missing_identities_remain_explicit_without_distracting_the_rationale(self):
-        cases = (("settle_invoice", "invoiceNumber", "not a duplicate"),
-                 ("hold_invoice", "vendorName", "verification is still pending"),
-                 ("open_exception", "vendorName", "requires the exception workflow"))
-        for action, field, explanation in cases:
+    def test_absent_schema_identities_use_controlling_commercial_identifiers(self):
+        cases = (("settle_invoice", "invoiceNumber", "PO-CURRENT"),
+                 ("hold_invoice", "vendorName", "AC-OLD"),
+                 ("open_exception", "vendorName", "AC-OLD"))
+        for action, field, expected in cases:
             with self.subTest(action=action):
                 decision = q10.decide(invoice_package(action))
-                self.assertEqual(decision["facts"][field], "unknown")
-                self.assertEqual(decision["unresolvedFacts"], [field])
+                self.assertEqual(decision["facts"][field], expected)
+                self.assertEqual(decision["unresolvedFacts"], [])
+                self.assertIn(expected, decision["rationale"])
                 self.assertNotIn("Missing source fields", decision["rationale"])
-                self.assertIn(explanation, decision["rationale"])
-                for reference in decision["evidenceRefs"]:
-                    self.assertEqual(decision["rationale"].count("[" + reference + "]"), 1)
 
     def test_document_permutations_preserve_full_decision(self):
         for action in q10.ACTIONS:
@@ -159,7 +152,10 @@ class InvoiceEvidenceTests(unittest.TestCase):
         self.assertEqual(decision["facts"]["vendorName"], "Example Industries")
         self.assertEqual(decision["evidenceRefs"], ["R_SOURCE0", "R_SOURCE1", "R_SOURCE2"])
         package["documents"][0]["text"] = package["documents"][0]["text"].replace("Example Industries", "AC-OLD")
-        self.assertEqual(q10.decide(package)["facts"]["vendorName"], "unknown")
+        account_decision = q10.decide(package)
+        self.assertEqual(account_decision["facts"]["vendorName"], "AC-OLD")
+        self.assertEqual(account_decision["unresolvedFacts"], [])
+        self.assertNotIn("Missing source fields", account_decision["rationale"])
 
     def test_invoice_reference_to_order_is_not_a_second_order_record(self):
         texts = [
