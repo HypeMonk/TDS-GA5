@@ -158,8 +158,8 @@ class OfflineLiveRegressions(unittest.TestCase):
     def test_distributed_invoice_records_are_order_independent(self):
         expected = {
             "duplicate": ("reject_duplicate", "INV-TEST-1", "Example Supplier", []),
-            "settle_missing_invoice": ("settle_invoice", "PO-TEST-2", "Example Supplier", []),
-            "exception": ("open_exception", "INV-TEST-3", "AC-333", []),
+            "settle_missing_invoice": ("settle_invoice", "unknown", "Example Supplier", ["invoiceNumber"]),
+            "exception": ("open_exception", "INV-TEST-3", "unknown", ["vendorName"]),
         }
         for case, values in expected.items():
             pkg = package(case)
@@ -221,9 +221,9 @@ class OfflineLiveRegressions(unittest.TestCase):
                 proposals = response.json()["task"]["artifacts"][0]["parts"][0]["data"]["proposals"]
                 baseline = q10.decide(packages[0])
                 self.assertTrue(all(proposal["rationale"] == baseline["rationale"] for proposal in proposals))
-                self.assertTrue(all(proposal["facts"]["invoiceNumber"] == "PO-TEST-2" for proposal in proposals))
+                self.assertTrue(all(proposal["facts"]["invoiceNumber"] == "unknown" for proposal in proposals))
                 self.assertTrue(all(proposal["action"] == "settle_invoice" for proposal in proposals))
-                self.assertNotIn("Missing source fields", baseline["rationale"])
+                self.assertIn("Missing source fields: invoiceNumber", baseline["rationale"])
                 for reference in baseline["evidenceRefs"]:
                     self.assertEqual(baseline["rationale"].count(reference + ': "'), 1)
         asyncio.run(exercise())

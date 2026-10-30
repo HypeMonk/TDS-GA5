@@ -23,7 +23,9 @@ def decode(value):
 
 def captured_proposals():
     seen = set()
-    for path in ROOT.parent.glob("render-q2-business-*/q10-http.json"):
+    paths = list(ROOT.parent.glob("render-q2-business-*/q10-http.json"))
+    paths += list(ROOT.parent.glob("q2-v31-review-*/q10-http.json"))
+    for path in paths:
         sends, outcomes = {}, {}
         for row in json.loads(path.read_text(encoding="utf-8")):
             if row.get("status_code") != 200:
@@ -61,14 +63,18 @@ class RenderBusinessTests(unittest.TestCase):
         records = [(q10.BRACKET_REF.findall(paragraph), paragraph) for _, paragraph in q10._case_paragraphs(package)]
         selected = "\n".join(text for refs, text in records if set(refs) & set(decision["evidenceRefs"]))
         for field in ("invoiceNumber", "vendorName"):
-            self.assertNotEqual(decision["facts"][field], "unknown")
-            self.assertIn(decision["facts"][field], selected)
+            value = decision["facts"][field]
+            if value == "unknown":
+                self.assertIn(field, decision.get("unresolvedFacts", []))
+                self.assertIn("Missing source fields", decision["rationale"])
+            else:
+                self.assertIn(value, selected)
         self.assertEqual(len(set(decision["evidenceRefs"])), 3)
         self.assertTrue(60 <= len(decision["rationale"]) <= 1500)
         for ref in decision["evidenceRefs"]:
             self.assertEqual(decision["rationale"].count(ref + ': "'), 1)
 
-    def test_current_order_is_used_not_the_previously_paid_order(self):
+    def test_current_order_is_not_substituted_for_a_missing_invoice(self):
         for action in ("settle_invoice", "request_approval"):
             for currency in ("USD", "EUR", "INR", "JPY", "KWD"):
                 with self.subTest(action=action, currency=currency):
@@ -76,16 +82,18 @@ class RenderBusinessTests(unittest.TestCase):
                     package = fixtures.invoice_package(action, ceiling=ceiling, currency=currency)
                     decision = q10.decide(package)
                     self.assertEqual(decision["action"], action)
-                    self.assertEqual(decision["facts"]["invoiceNumber"], "PO-CURRENT")
+                    self.assertEqual(decision["facts"]["invoiceNumber"], "unknown")
+                    self.assertIn("PO-CURRENT", decision["rationale"])
                     self.assertNotEqual(decision["facts"]["invoiceNumber"], "PO-EARLIER")
                     self.assert_source_binding(package, decision)
 
-    def test_signed_payee_is_used_not_unverified_new_account(self):
+    def test_signed_payee_account_is_not_a_vendor_name(self):
         for action in ("hold_invoice", "open_exception"):
             package = fixtures.invoice_package(action)
             decision = q10.decide(package)
             self.assertEqual(decision["action"], action)
-            self.assertEqual(decision["facts"]["vendorName"], "AC-OLD")
+            self.assertEqual(decision["facts"]["vendorName"], "unknown")
+            self.assertIn("AC-OLD", decision["rationale"])
             self.assert_source_binding(package, decision)
 
     def test_reference_renaming_and_document_order_do_not_change_identity(self):
@@ -102,7 +110,7 @@ class RenderBusinessTests(unittest.TestCase):
         package = fixtures.invoice_package("hold_invoice")
         package["documents"][-1]["text"] = "[R_ARCHIVE] Archived supplier memo says invoice INV-DECOY-1 belongs to Decoy Vendor with account AC-NEW."
         actual = q10.decide(package)
-        self.assertEqual(actual["facts"]["vendorName"], "AC-OLD")
+        self.assertEqual(actual["facts"]["vendorName"], "unknown")
         self.assertEqual(actual["facts"]["invoiceNumber"], "INV-TEST-1")
         self.assertNotIn("R_ARCHIVE", actual["evidenceRefs"])
 
@@ -116,7 +124,43 @@ class RenderBusinessTests(unittest.TestCase):
         self.assertEqual(decision["facts"]["vendorName"], "unknown")
         self.assertEqual(decision["unresolvedFacts"], ["vendorName"])
 
-    def test_render_capture_preserves_accepted_and_changes_only_missing_identities(self):
+    def test_explicit_human_payee_name_is_preserved(self):
+        package = fixtures.invoice_package("hold_invoice")
+        package["documents"][0]["text"] = package["documents"][0]["text"].replace("payee AC-OLD", "payee Northstar")
+        decision = q10.decide(package)
+        self.assertEqual(decision["facts"]["vendorName"], "Northstar")
+        self.assertEqual(decision["unresolvedFacts"], [])
+        self.assert_source_binding(package, decision)
+
+    def test_current_signed_payee_wins_over_historical_ledger_vendor(self):
+        package = fixtures.invoice_package("open_exception")
+        package["documents"][0]["text"] = package["documents"][0]["text"].replace("payee AC-OLD", "payee Northstar")
+        package["documents"].append({"name": "ledger.txt", "text": "[R_PREVIOUS] Payment ledger: a disbursement for USD 200.00 to Previous Supplier previously settled order PO-EARLIER. The currently submitted order is PO-CURRENT."})
+        decision = q10.decide(package)
+        self.assertEqual(decision["action"], "open_exception")
+        self.assertEqual(decision["facts"]["vendorName"], "Northstar")
+        self.assert_source_binding(package, decision)
+
+    def test_current_semantic_invoice_vendor_wins_over_historical_payment(self):
+        package = {"packageId": "pkg-current-vendor", "documents": [
+            {"name": "invoice.txt", "text": "[R_CURRENT] Signed invoice record INV-CURRENT-1 for purchase order PO-CURRENT-1 names payee Northstar Labs and USD 200.00."},
+            {"name": "ledger.txt", "text": "[R_PREVIOUS] Current ledger: payment of USD 200.00 to Previous Supplier settled PO-OLD-1. The currently submitted order is PO-CURRENT-1."},
+            {"name": "authority.txt", "text": "[R_AUTHORITY] Delegated settlement authority ceiling is USD 500.00."}]}
+        decision = q10.decide(package)
+        self.assertEqual(decision["action"], "settle_invoice")
+        self.assertEqual(decision["facts"]["vendorName"], "Northstar Labs")
+        self.assert_source_binding(package, decision)
+
+    def test_namespace_and_date_do_not_invent_an_invoice(self):
+        package = fixtures.invoice_package("settle_invoice")
+        for identity, date in (("pkg-alternate-123", "2025-01-01T08:30:00Z"),
+                               ("pkg-alternate-987", "2026-12-01T08:30:00Z")):
+            current = dict(package, packageId=identity, receivedAt=date)
+            decision = q10.decide(current)
+            self.assertEqual(decision["facts"]["invoiceNumber"], "unknown")
+            self.assert_source_binding(current, decision)
+
+    def test_render_capture_preserves_accepted_and_flags_missing_data(self):
         accepted = rejected = 0
         for package, original, outcome in captured_proposals():
             actual = q10.decide(package)
@@ -130,14 +174,15 @@ class RenderBusinessTests(unittest.TestCase):
                     self.assertEqual(actual["action"], original["action"])
                     self.assertEqual(actual["evidenceRefs"], original["evidenceRefs"])
                     for field, value in original["facts"].items():
-                        if value != "unknown":
+                        if field not in actual.get("unresolvedFacts", []):
                             self.assertEqual(actual["facts"][field], value)
+                    self.assertTrue(actual["unresolvedFacts"])
                     self.assert_source_binding(package, actual)
         if not accepted and not rejected:
             self.skipTest("No local Render capture available")
         self.assertGreater(accepted, 0)
         self.assertGreater(rejected, 0)
-        print("Render replay: %d accepted proposals preserved; %d rejected identity cases changed without action/amount/reference changes" % (accepted, rejected))
+        print("Render replay: %d accepted proposals preserved; %d rejected cases retain explicit missing-data markers; no new grade verified" % (accepted, rejected))
 
 
 if __name__ == "__main__":

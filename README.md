@@ -4,17 +4,19 @@ A single FastAPI deployment for the assignment endpoints. The Q2–Q4 agent path
 
 ## Offline decision model
 
-- **Invoice/A2A:** extracts current commercial identities, amounts, order/payment relationships, authority ceilings, bank verification, and exactly three controlling references. It supports both the ordinary cover/ledger layout and distributed/paraphrased records independent of file order. The `offline-v31` candidate uses the supplied current-order or signed-payee identifier when a separate invoice number or human-readable vendor is absent. It does not manufacture an invoice number or vendor name; truly unsupported identities remain `unknown`. Actions follow the signed records, ledger, verification state, and authority boundary.
+- **Invoice/A2A:** extracts commercial names, invoice numbers, amounts, payment/order relationships, authority limits, bank verification, and exactly three controlling references. A purchase-order identifier is not an invoice number, and a bank-account identifier is not a vendor name. When the required name or invoice number is absent, the local `offline-v32` candidate returns an explicit `unknown` marker and records the unresolved field rather than inventing or substituting a different identity.
 - **Mailroom:** selects actions from source kind, provenance, current authenticated state, signed scope, exact request identity, and least privilege. Standing approvals and request-controlled notices are handled separately. Contradictory or unsupported evidence returns HTTP 422 without a model call.
 - **Incident response:** classifies unique positive causal relations, validates catalog-bound arguments, evaluates bounded numeric/Boolean operating rules, enforces approval gates, and persists receipt-driven state and OTLP topology.
 
 The solver is designed to generalize through entities and relationships rather than fixed generated IDs. Arbitrary natural-language input can still be ambiguous; those cases fail closed instead of being guessed.
 
-## Q2 Render business candidate
+## Q2 source-identity candidate
 
-`offline-v31` includes the Q2 business candidate based on the Render deployment's retained invoice logs. All nine recorded rejected audit proposals had an `unknown` identity; accepted audit proposals had complete identities. The candidate binds a missing invoice label to the explicit signed current order, and a missing human-readable vendor label to the explicit signed payee account. It restores the detailed rationale quoting each controlling source. This is a source-supported schema interpretation, not a confirmed hidden-grader expectation.
+The deployed `offline-v31` order/payee substitutions did not resolve the residual business deductions. A new retained capture contains nine rejected audit cases: five do not supply a distinct invoice number, and four do not supply a human-readable vendor name. No extra identity catalogue or mapping is present in those requests. The current public question does not document what value to return when either required identity is absent.
 
-The candidate leaves previously populated facts, actions, monetary amounts, currencies, and evidence references unchanged in the captured rejected cases. Recorded accepted proposals are replayed to check for regressions. Q3 source, task lifecycle, local SQLite storage, and dependencies are unchanged. This branch is based on `origin/main`, not the separate Vercel/PostgreSQL repair branch. Full marks require a new live evaluation; local tests cannot establish them.
+The local `offline-v32` candidate removes the unsupported substitutions, prefers an explicit current-invoice payee name over a historical payment’s supplier name, and keeps the detailed source-bound rationale. This vendor-precedence correction is covered by distributed and paraphrased regression cases. It does not change actions, amounts, currencies, evidence selection, task lifecycle, SQLite storage, or Q3/Q4. `unknown` is an honest unresolved marker, not a proven full-score sentinel. This patch is for source correctness and is not claimed to restore 4/4.
+
+The grading blocker needs clarification: should a missing identity be included in the audit input, or should an unresolved marker be accepted? Returning an order number or account number under a different field label is not evidence of the missing commercial fact. Keep new grader checks separate from local validation; do not infer a new score from a replay.
 
 ## Q4 Render audit wording fix
 
@@ -36,9 +38,15 @@ Optional:
 
 No provider API key is required for Q2–Q4.
 
+## Q2 submission URL
+
+For a new deployment, prefer its root HTTPS URL with a trailing slash, for example `https://your-service.onrender.com/`. The same transport handlers are also served under `/a2a/`; that suffix is optional, not a requirement. The Agent Card advertises both interfaces.
+
+Keep one base URL for a controlled test. A lower score on a separate Check does not establish that the prefix caused it: every Check/Save can use a new audit. If protocol marks remain full and feedback only reports business semantics, investigate the proposal rather than switching paths.
+
 ## Health and diagnostics
 
-- `/health` — readiness and version (`offline-v31`)
+- `/health` — readiness and version (`offline-v32`)
 - `/debug/q9` — redacted durable Q3 proposal records
 - `/debug/q9/commitwire` — redacted Q3 receipt/outcome records
 - `/debug/q10` — redacted recent Q2 HTTP records
