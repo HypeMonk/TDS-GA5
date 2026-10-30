@@ -64,8 +64,8 @@ class RenderBusinessTests(unittest.TestCase):
         selected = "\n".join(text for refs, text in records if set(refs) & set(decision["evidenceRefs"]))
         for field in ("invoiceNumber", "vendorName"):
             value = decision["facts"][field]
-            if value == "unknown":
-                self.assertIn(field, decision.get("unresolvedFacts", []))
+            if field in decision.get("unresolvedFacts", []):
+                self.assertEqual(value, "not provided")
                 self.assertIn("Missing source fields", decision["rationale"])
             else:
                 self.assertIn(value, selected)
@@ -73,11 +73,7 @@ class RenderBusinessTests(unittest.TestCase):
         self.assertTrue(60 <= len(decision["rationale"]) <= 1500)
         for ref in decision["evidenceRefs"]:
             self.assertEqual(decision["rationale"].count(ref), 1)
-            if decision.get("unresolvedFacts"):
-                self.assertIn("[" + ref + "] ", decision["rationale"])
-                self.assertTrue(fixtures.citation_text(decision["rationale"], ref).strip())
-            else:
-                self.assertEqual(decision["rationale"].count(ref + ': "'), 1)
+            self.assertEqual(decision["rationale"].count(ref + ': "'), 1)
 
     def test_current_order_is_not_substituted_for_a_missing_invoice(self):
         for action in ("settle_invoice", "request_approval"):
@@ -87,7 +83,7 @@ class RenderBusinessTests(unittest.TestCase):
                     package = fixtures.invoice_package(action, ceiling=ceiling, currency=currency)
                     decision = q10.decide(package)
                     self.assertEqual(decision["action"], action)
-                    self.assertEqual(decision["facts"]["invoiceNumber"], "unknown")
+                    self.assertEqual(decision["facts"]["invoiceNumber"], "not provided")
                     self.assertIn("PO-CURRENT", decision["rationale"])
                     self.assertNotEqual(decision["facts"]["invoiceNumber"], "PO-EARLIER")
                     self.assert_source_binding(package, decision)
@@ -97,7 +93,7 @@ class RenderBusinessTests(unittest.TestCase):
             package = fixtures.invoice_package(action)
             decision = q10.decide(package)
             self.assertEqual(decision["action"], action)
-            self.assertEqual(decision["facts"]["vendorName"], "unknown")
+            self.assertEqual(decision["facts"]["vendorName"], "not provided")
             self.assertIn("AC-OLD", decision["rationale"])
             self.assert_source_binding(package, decision)
 
@@ -115,7 +111,7 @@ class RenderBusinessTests(unittest.TestCase):
         package = fixtures.invoice_package("hold_invoice")
         package["documents"][-1]["text"] = "[R_ARCHIVE] Archived supplier memo says invoice INV-DECOY-1 belongs to Decoy Vendor with account AC-NEW."
         actual = q10.decide(package)
-        self.assertEqual(actual["facts"]["vendorName"], "unknown")
+        self.assertEqual(actual["facts"]["vendorName"], "not provided")
         self.assertEqual(actual["facts"]["invoiceNumber"], "INV-TEST-1")
         self.assertNotIn("R_ARCHIVE", actual["evidenceRefs"])
 
@@ -126,7 +122,7 @@ class RenderBusinessTests(unittest.TestCase):
             {"name": "control.txt", "text": "[R_CONTROL] Remittance controls require payment to pause until independent verification completes."}]}
         decision = q10.decide(package)
         self.assertEqual(decision["action"], "hold_invoice")
-        self.assertEqual(decision["facts"]["vendorName"], "unknown")
+        self.assertEqual(decision["facts"]["vendorName"], "not provided")
         self.assertEqual(decision["unresolvedFacts"], ["vendorName"])
 
     def test_explicit_human_payee_name_is_preserved(self):
@@ -162,7 +158,7 @@ class RenderBusinessTests(unittest.TestCase):
                                ("pkg-alternate-987", "2026-12-01T08:30:00Z")):
             current = dict(package, packageId=identity, receivedAt=date)
             decision = q10.decide(current)
-            self.assertEqual(decision["facts"]["invoiceNumber"], "unknown")
+            self.assertEqual(decision["facts"]["invoiceNumber"], "not provided")
             self.assert_source_binding(current, decision)
 
     def test_render_capture_preserves_accepted_and_flags_missing_data(self):
