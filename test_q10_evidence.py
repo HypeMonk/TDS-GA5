@@ -43,6 +43,13 @@ def invoice_package(action="settle_invoice", ceiling="250.00", bank_with_ledger=
     return {"packageId": "pkg-evidence", "documents": documents}
 
 
+def citation_text(rationale, reference):
+    marker = f"[{reference}] "
+    if marker in rationale:
+        return rationale.split(marker, 1)[1].split(" [", 1)[0].split(" Missing source fields:", 1)[0]
+    return rationale.split(f'{reference}: "', 1)[1].split('".', 1)[0]
+
+
 class InvoiceEvidenceTests(unittest.TestCase):
     def assert_citations(self, package, decision):
         rationale = decision["rationale"]
@@ -54,7 +61,15 @@ class InvoiceEvidenceTests(unittest.TestCase):
             ref, text = doc["text"].split("] ", 1)
             ref = ref[1:]
             self.assertEqual(rationale.count(ref), 1)
-            self.assertIn(f'{ref}: "{text}".', rationale)
+            if decision.get("unresolvedFacts"):
+                self.assertIn(f"[{ref}] ", rationale)
+                self.assertTrue(citation_text(rationale, ref).strip())
+            else:
+                self.assertIn(f'{ref}: "{text}".', rationale)
+        if decision.get("unresolvedFacts"):
+            self.assertIn("Missing source fields: " + ", ".join(decision["unresolvedFacts"]), rationale)
+            self.assertIn(str(decision["facts"]["amountMinor"]), citation_text(rationale, "R_SOURCE0"))
+            self.assertIn(decision["facts"]["currency"], citation_text(rationale, "R_SOURCE0"))
         self.assertNotIn("R_DECOY00", rationale)
 
     def test_each_action_cites_actual_sources(self):
@@ -73,10 +88,12 @@ class InvoiceEvidenceTests(unittest.TestCase):
         decision = q10.decide(package)
         self.assertEqual(decision["action"], "request_approval")
         self.assert_citations(package, decision)
-        ceiling_citation = decision["rationale"].split('R_SOURCE2: "', 1)[1].split('".', 1)[0]
+        ceiling_citation = citation_text(decision["rationale"], "R_SOURCE2")
         self.assertNotIn("callback", ceiling_citation)
         self.assertNotIn("account", ceiling_citation)
-        self.assertIn("above the 19999 minor-unit ceiling", decision["rationale"])
+        self.assertNotIn("verification", ceiling_citation)
+        self.assertIn("Remittance verification is confirmed", citation_text(decision["rationale"], "R_SOURCE1"))
+        self.assertIn("above the 19999 minor-unit ceiling", ceiling_citation)
 
     def test_authority_boundary_includes_equality(self):
         for ceiling, expected in (("199.99", "request_approval"), ("200.00", "settle_invoice"), ("200.01", "settle_invoice")):

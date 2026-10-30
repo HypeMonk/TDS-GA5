@@ -4,7 +4,7 @@ A single FastAPI deployment for the assignment endpoints. The Q2–Q4 agent path
 
 ## Offline decision model
 
-- **Invoice/A2A:** extracts commercial names, invoice numbers, amounts, payment/order relationships, authority limits, bank verification, and exactly three controlling references. A purchase-order identifier is not an invoice number, and a bank-account identifier is not a vendor name. When the required name or invoice number is absent, the local `offline-v32` candidate returns an explicit `unknown` marker and records the unresolved field rather than inventing or substituting a different identity.
+- **Invoice/A2A:** extracts commercial names, invoice numbers, amounts, payment/order relationships, authority limits, bank verification, and exactly three controlling references. A purchase-order identifier is not an invoice number, and a bank-account identifier is not a vendor name. When the required name or invoice number is absent, the solver returns an explicit `unknown` marker and records the unresolved field rather than inventing or substituting a different identity.
 - **Mailroom:** selects actions from source kind, provenance, current authenticated state, signed scope, exact request identity, and least privilege. Standing approvals and request-controlled notices are handled separately. Contradictory or unsupported evidence returns HTTP 422 without a model call.
 - **Incident response:** classifies unique positive causal relations, validates catalog-bound arguments, evaluates bounded numeric/Boolean operating rules, enforces approval gates, and persists receipt-driven state and OTLP topology.
 
@@ -14,9 +14,15 @@ The solver is designed to generalize through entities and relationships rather t
 
 The deployed `offline-v31` order/payee substitutions did not resolve the residual business deductions. A new retained capture contains nine rejected audit cases: five do not supply a distinct invoice number, and four do not supply a human-readable vendor name. No extra identity catalogue or mapping is present in those requests. The current public question does not document what value to return when either required identity is absent.
 
-The local `offline-v32` candidate removes the unsupported substitutions, prefers an explicit current-invoice payee name over a historical payment’s supplier name, and keeps the detailed source-bound rationale. This vendor-precedence correction is covered by distributed and paraphrased regression cases. It does not change actions, amounts, currencies, evidence selection, task lifecycle, SQLite storage, or Q3/Q4. `unknown` is an honest unresolved marker, not a proven full-score sentinel. This patch is for source correctness and is not claimed to restore 4/4.
+The `offline-v32` baseline removes the unsupported substitutions, prefers an explicit current-invoice payee name over a historical payment’s supplier name, and keeps the detailed source-bound rationale. This vendor-precedence correction is covered by distributed and paraphrased regression cases. It does not change actions, amounts, currencies, evidence selection, task lifecycle, SQLite storage, or Q3/Q4. `unknown` is an honest unresolved marker, not a proven full-score sentinel. This patch is for source correctness and is not claimed to restore 4/4.
 
 The grading blocker needs clarification: should a missing identity be included in the audit input, or should an unresolved marker be accepted? Returning an order number or account number under a different field label is not evidence of the missing commercial fact. Keep new grader checks separate from local validation; do not infer a new score from a replay.
+
+## Q2 Trial A: rationale only
+
+`offline-v33-a` tests concise, bracket-cited causal explanations only when the distributed or semantic parser reports an unresolved invoice/vendor identity. Facts, actions, amounts, currencies, evidence arrays, and unresolved-field reporting stay identical to the pushed `offline-v32` baseline. Complete-identity proposals retain the original source-quotation rationale. Known signed payee accounts are described as accounts, not substituted for vendor names; bank confirmation is attributed only to the reference containing it. Overlength explanations fall back to the bounded source-excerpt format.
+
+Use this experiment on the isolated Q2 service from `fix/q2-source-identities`, not production `main`. A branch push can auto-deploy that test service if Render auto-deploy is enabled. Keep its root URL unchanged between trials, export the audit outcomes before another deployment, and evaluate acceptance of the previously failing audit shape rather than just the rounded score. Local tests and replay do not establish a new grader score. Trial B (a different missing-data marker) is not included in this release.
 
 ## Q4 Render audit wording fix
 
@@ -46,7 +52,7 @@ Keep one base URL for a controlled test. A lower score on a separate Check does 
 
 ## Health and diagnostics
 
-- `/health` — readiness and version (`offline-v32`)
+- `/health` — readiness and version (`offline-v33-a`)
 - `/debug/q9` — redacted durable Q3 proposal records
 - `/debug/q9/commitwire` — redacted Q3 receipt/outcome records
 - `/debug/q10` — redacted recent Q2 HTTP records
@@ -92,6 +98,7 @@ The analysis preserves each rejected proposal's parser, facts, evidence, rationa
 ```powershell
 python -I -B test_q10_evidence.py
 python -I -B test_q2_render_business.py
+python -I -B test_q2_rationale_trial.py
 python -I -B test_q4_render_audits.py
 python -I -B test_q10_traces.py
 python -I -B test_capture_q2_traces.py

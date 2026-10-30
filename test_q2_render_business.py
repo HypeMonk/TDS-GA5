@@ -72,7 +72,12 @@ class RenderBusinessTests(unittest.TestCase):
         self.assertEqual(len(set(decision["evidenceRefs"])), 3)
         self.assertTrue(60 <= len(decision["rationale"]) <= 1500)
         for ref in decision["evidenceRefs"]:
-            self.assertEqual(decision["rationale"].count(ref + ': "'), 1)
+            self.assertEqual(decision["rationale"].count(ref), 1)
+            if decision.get("unresolvedFacts"):
+                self.assertIn("[" + ref + "] ", decision["rationale"])
+                self.assertTrue(fixtures.citation_text(decision["rationale"], ref).strip())
+            else:
+                self.assertEqual(decision["rationale"].count(ref + ': "'), 1)
 
     def test_current_order_is_not_substituted_for_a_missing_invoice(self):
         for action in ("settle_invoice", "request_approval"):

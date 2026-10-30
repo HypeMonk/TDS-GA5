@@ -225,7 +225,8 @@ class OfflineLiveRegressions(unittest.TestCase):
                 self.assertTrue(all(proposal["action"] == "settle_invoice" for proposal in proposals))
                 self.assertIn("Missing source fields: invoiceNumber", baseline["rationale"])
                 for reference in baseline["evidenceRefs"]:
-                    self.assertEqual(baseline["rationale"].count(reference + ': "'), 1)
+                    self.assertEqual(baseline["rationale"].count("[" + reference + "]"), 1)
+                self.assertNotIn(': "', baseline["rationale"])
         asyncio.run(exercise())
 
     def test_public_diagnostics_redact_private_content_and_wire_details_require_key(self):

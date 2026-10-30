@@ -101,7 +101,7 @@ def _q10_batch_part(message):
 
 # -------------------------------------------------------------- diagnostics
 
-SOLVER_VERSION = "offline-v32"
+SOLVER_VERSION = "offline-v33-a"
 _TRACE_DB_PATH = os.environ.get("Q10_TRACE_DB", DB_PATH + ".traces")
 _TRACE_BODY_LIMIT = 2 * 1024 * 1024
 _TRACE_STORAGE_LIMIT = 32 * 1024 * 1024
@@ -988,33 +988,55 @@ def _relationship_rationale(action, facts, current_order, evidence, details, sou
     return lead + " ".join(citations) + suffix
 
 
-def _incomplete_identity_rationale(action, facts, current_order, evidence, details):
-    """Explain the action from controlling relationships without inventing identity."""
-    first, second, third = (f"[{reference}]" for reference in evidence)
-    amount = facts["amountMinor"]
-    currency = facts["currency"]
+def _incomplete_identity_rationale(action, facts, current_order, evidence, details, sources):
+    """Explain a parsed incomplete case with one source-bound claim per reference."""
+    first, second, third = evidence
+    amount, currency = facts["amountMinor"], facts["currency"]
+    invoice = facts["invoiceNumber"]
+    if invoice == "unknown":
+        first_claim = f"Records current order {current_order} and a billed amount of {amount} minor units of {currency}."
+        if re.search(r"receiving entry confirms the billed units", sources[first], re.I):
+            first_claim += " The receiving entry confirms the billed units."
+    else:
+        first_claim = f"Identifies invoice {invoice} for order {current_order}, billed at {amount} minor units of {currency}."
+    payee_account = re.search(r"\b(?:payee|beneficiary|vendor(?: account)?)\s+(?:is\s+)?(AC-[A-Z0-9-]+)\b",
+                              sources[first], re.I)
+    if facts["vendorName"] == "unknown" and payee_account:
+        first_claim += f" Names signed payee account {payee_account.group(1)}, not a human-readable vendor."
+
     if action == "reject_duplicate":
-        return (f"Action reject_duplicate: {first} establishes the signed current invoice, order, and payable "
-                f"{amount} minor units of {currency}. {second} proves that a prior disbursement settled that same "
-                f"commercial order, not merely a similar amount. {third} prohibits paying an already discharged "
-                "order again.")
-    if action == "open_exception":
-        return (f"Action open_exception: {first} establishes the submitted invoice, current order, and payable "
-                f"{amount} minor units of {currency}. {second} proves that the signed order total conflicts with "
-                f"the submitted invoice and that no corrected invoice exists. {third} requires the exception "
-                "workflow for an unresolved material order/invoice difference.")
-    if action == "hold_invoice":
-        return (f"Action hold_invoice: {first} establishes the signed current invoice, order, and payable "
-                f"{amount} minor units of {currency}. {second} proves that remittance changed and independent "
-                f"verification is still pending. {third} requires payment to remain paused until that verification "
-                "completes.")
-    comparison = "within" if action == "settle_invoice" else "above"
-    consequence = "permits autonomous settlement" if action == "settle_invoice" else "requires a named approver"
-    return (f"Action {action}: {first} establishes signed current order {current_order}, matching received units, "
-            f"and a payable {amount} minor units of {currency}. {second} proves that the recorded payment settled "
-            f"different order {details['paidOrder']}, so this claim is not a duplicate. {third} establishes the "
-            f"{details['limitMinor']} minor-unit authority ceiling; the payable is {comparison} that ceiling, which "
-            f"{consequence}.")
+        second_claim = "Records a settled payment for this same commercial order."
+        third_claim = "Prohibits a second payment for an already discharged order; reject the duplicate."
+    elif action == "open_exception":
+        second_claim = "Shows a discrepancy in the controlling signed commercial records."
+        third_claim = "Requires the exception workflow for that unresolved discrepancy."
+    elif action == "hold_invoice":
+        second_claim = "Records changed remittance instructions with verification still pending."
+        third_claim = "Requires payment to remain paused until verification completes."
+    else:
+        second_claim = f"Records payment against different order {details['paidOrder']}, not current order {current_order}."
+        comparison = "within" if action == "settle_invoice" else "above"
+        consequence = "Autonomous settlement is permitted" if action == "settle_invoice" else "A named approver is required before payment"
+        third_claim = f"The payable is {comparison} the {details['limitMinor']} minor-unit ceiling for {currency}. {consequence}."
+
+    claims = {first: first_claim, second: second_claim, third: third_claim}
+    if action in ("settle_invoice", "request_approval"):
+        for reference in evidence:
+            bank = _AUDIT_COMPONENTS["bank"].search(sources[reference])
+            if bank:
+                confirmed = bank.group(3) == "confirmed through the established vendor channel"
+            else:
+                semantic_bank = _semantic_bank_record(sources[reference])
+                confirmed = bool(semantic_bank and semantic_bank[2])
+            if confirmed:
+                claims[reference] += " Remittance verification is confirmed in this record."
+    missing = [field for field in ("vendorName", "invoiceNumber") if facts[field] == "unknown"]
+    rationale = f"Action {action} for order {current_order}. "
+    rationale += " ".join(f"[{reference}] {claims[reference]}" for reference in evidence)
+    rationale += " Missing source fields: " + ", ".join(missing) + "; these remain unknown rather than invented."
+    if len(rationale) > 1500:
+        return _relationship_rationale(action, facts, current_order, evidence, details, sources)
+    return rationale
 
 
 def _named_payee(value):
@@ -1099,7 +1121,8 @@ def distributed_decision(pkg):
                    if "ceiling" in components else None)
     details = {"paidOrder": ledger[3] if ledger else None, "limitMinor": limit_minor}
     missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
-    rationale = _relationship_rationale(action, facts, current_order, evidence, details, sources)
+    rationale = (_incomplete_identity_rationale(action, facts, current_order, evidence, details, sources)
+                 if missing else _relationship_rationale(action, facts, current_order, evidence, details, sources))
     return {"action": action, "facts": facts, "evidenceRefs": evidence, "rationale": rationale,
             "unresolvedFacts": missing}
 
@@ -1257,7 +1280,8 @@ def semantic_distributed_decision(pkg):
     details = {"paidOrder": ledger[1][2] if ledger else None,
                "limitMinor": ceilings[0][1][1] if ceilings else None}
     sources = {ref: text for ref, text, _roles in records}
-    rationale = _relationship_rationale(action, facts, current_order, evidence, details, sources)
+    rationale = (_incomplete_identity_rationale(action, facts, current_order, evidence, details, sources)
+                 if missing else _relationship_rationale(action, facts, current_order, evidence, details, sources))
     return {"action": action, "facts": facts, "evidenceRefs": evidence,
             "rationale": rationale, "unresolvedFacts": missing}
 
