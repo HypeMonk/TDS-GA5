@@ -103,7 +103,7 @@ class InvoiceEvidenceTests(unittest.TestCase):
             with self.subTest(action=action):
                 package = invoice_package(action)
                 decision = q10.decide(package)
-                self.assertEqual(decision["facts"][field], "unknown")
+                self.assertEqual(decision["facts"][field], "")
                 self.assertEqual(decision["unresolvedFacts"], [field])
                 self.assertIn(identifier, decision["rationale"])
                 self.assert_citations(package, decision)
@@ -164,7 +164,7 @@ class InvoiceEvidenceTests(unittest.TestCase):
         self.assertEqual(decision["facts"]["vendorName"], "Example Industries")
         self.assertEqual(decision["evidenceRefs"], ["R_SOURCE0", "R_SOURCE1", "R_SOURCE2"])
         package["documents"][0]["text"] = package["documents"][0]["text"].replace("Example Industries", "AC-OLD")
-        self.assertEqual(q10.decide(package)["facts"]["vendorName"], "unknown")
+        self.assertEqual(q10.decide(package)["facts"]["vendorName"], "")
 
     def test_invoice_reference_to_order_is_not_a_second_order_record(self):
         texts = [

@@ -1,4 +1,4 @@
-"""Trial C removes only the missing-identity footer from v32 rationales."""
+"""Source-excerpt rationale regressions, independent of the missing-value marker."""
 import importlib.util
 import itertools
 from pathlib import Path
@@ -62,7 +62,7 @@ class MissingIdentityFooterTests(unittest.TestCase):
             self.assertTrue(baseline["rationale"].endswith(footer))
             self.assertEqual(trial["rationale"], baseline["rationale"][:-len(footer)])
             for field in missing:
-                self.assertEqual(trial["facts"][field], "unknown")
+                self.assertEqual(trial["facts"][field], q10.MISSING_IDENTITY_MARKER)
         else:
             self.assertEqual(trial, baseline)
 
@@ -108,7 +108,7 @@ class MissingIdentityFooterTests(unittest.TestCase):
                 decision = q10.decide(package, trace)
                 self.assertEqual(trace["parser"], "semantic")
                 self.assertEqual(decision["action"], "settle_invoice")
-                self.assertEqual(decision["facts"]["invoiceNumber"], "unknown")
+                self.assertEqual(decision["facts"]["invoiceNumber"], q10.MISSING_IDENTITY_MARKER)
                 for index in range(3):
                     citation = fixtures.citation_text(decision["rationale"], f"R_SOURCE{index}")
                     self.assertEqual("callback is confirmed" in citation, index == location)
@@ -157,7 +157,7 @@ class MissingIdentityFooterTests(unittest.TestCase):
                 decision = q10.decide(fixtures.invoice_package(action), trace)
                 self.assertEqual(trace["decision"], decision)
                 self.assertEqual(trace["factProvenance"][field],
-                                 {"value": "unknown", "status": "unresolved", "sources": []})
+                                 {"value": q10.MISSING_IDENTITY_MARKER, "status": "unresolved", "sources": []})
                 self.assertIn("unresolved_" + field, trace["warnings"])
                 self.assertFalse(trace["hiddenGraderAcceptanceKnown"])
 

@@ -101,7 +101,8 @@ def _q10_batch_part(message):
 
 # -------------------------------------------------------------- diagnostics
 
-SOLVER_VERSION = "offline-v35-c"
+SOLVER_VERSION = "offline-v36-d"
+MISSING_IDENTITY_MARKER = ""
 _TRACE_DB_PATH = os.environ.get("Q10_TRACE_DB", DB_PATH + ".traces")
 _TRACE_BODY_LIMIT = 2 * 1024 * 1024
 _TRACE_STORAGE_LIMIT = 32 * 1024 * 1024
@@ -1280,7 +1281,8 @@ def _decision_trace(pkg, decision, parser, attempts):
     facts = {}
     for field, value in decision["facts"].items():
         matches = []
-        if value != "unknown":
+        unresolved = field in decision.get("unresolvedFacts", []) or value == "unknown"
+        if not unresolved:
             for record in records:
                 if record["archiveMarker"]:
                     continue
@@ -1289,7 +1291,7 @@ def _decision_trace(pkg, decision, parser, attempts):
                 found = any(present) if field == "amountMinor" else str(value) in record["text"]
                 if found:
                     matches.append({"document": record["document"], "references": record["references"]})
-        facts[field] = {"value": value, "status": "unresolved" if value == "unknown" else
+        facts[field] = {"value": value, "status": "unresolved" if unresolved else
                         "present_in_source" if matches else "not_located", "sources": matches}
     relationships = []
     for record in records:
@@ -1326,6 +1328,9 @@ def decide(pkg, trace=None):
     attempts = []
 
     def finish(decision, parser):
+        for field in decision.get("unresolvedFacts", []):
+            if field in ("vendorName", "invoiceNumber") and decision["facts"][field] == "unknown":
+                decision["facts"][field] = MISSING_IDENTITY_MARKER
         if trace is not None:
             try:
                 trace.update(_decision_trace(pkg, decision, parser, attempts))
@@ -1585,7 +1590,8 @@ async def start_task(who, message, message_id, fingerprint, traces=None):
         d = decide(pkg, trace=trace)
         if trace is not None:
             if d.get("unresolvedFacts"):
-                trace["incompleteRationaleFormat"] = "concise-bracketed-causal"
+                trace["incompleteRationaleFormat"] = "source-excerpts-no-footer"
+                trace["missingIdentityMarker"] = "empty-string"
             traces.append(trace)
         proposals.append({
             "packageId": ids[i],
