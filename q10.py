@@ -101,8 +101,7 @@ def _q10_batch_part(message):
 
 # -------------------------------------------------------------- diagnostics
 
-SOLVER_VERSION = "offline-v34-b"
-MISSING_IDENTITY_MARKER = "not provided"
+SOLVER_VERSION = "offline-v35-c"
 _TRACE_DB_PATH = os.environ.get("Q10_TRACE_DB", DB_PATH + ".traces")
 _TRACE_BODY_LIMIT = 2 * 1024 * 1024
 _TRACE_STORAGE_LIMIT = 32 * 1024 * 1024
@@ -975,6 +974,7 @@ def _relationship_rationale(action, facts, current_order, evidence, details, sou
               if missing else "")
     excerpts = [" ".join(sources[ref].split()) for ref in evidence]
     overhead = sum(len(ref) + len(': "".') for ref in evidence) + len(evidence) - 1
+    # Keep v32's excerpt budget so the trial removes only the footer.
     budget = 1500 - len(lead) - len(suffix) - overhead
     limits = [0] * len(excerpts)
     for index in sorted(range(len(excerpts)), key=lambda i: len(excerpts[i])):
@@ -986,7 +986,7 @@ def _relationship_rationale(action, facts, current_order, evidence, details, sou
         if len(text) > limit:
             text = text[:max(0, limit - 3)].rsplit(" ", 1)[0] + "..."
         citations.append(f'{ref}: "{text}".')
-    return lead + " ".join(citations) + suffix
+    return lead + " ".join(citations)
 
 
 def _incomplete_identity_rationale(action, facts, current_order, evidence, details):
@@ -1280,8 +1280,7 @@ def _decision_trace(pkg, decision, parser, attempts):
     facts = {}
     for field, value in decision["facts"].items():
         matches = []
-        unresolved = field in decision.get("unresolvedFacts", []) or value == "unknown"
-        if not unresolved:
+        if value != "unknown":
             for record in records:
                 if record["archiveMarker"]:
                     continue
@@ -1290,7 +1289,7 @@ def _decision_trace(pkg, decision, parser, attempts):
                 found = any(present) if field == "amountMinor" else str(value) in record["text"]
                 if found:
                     matches.append({"document": record["document"], "references": record["references"]})
-        facts[field] = {"value": value, "status": "unresolved" if unresolved else
+        facts[field] = {"value": value, "status": "unresolved" if value == "unknown" else
                         "present_in_source" if matches else "not_located", "sources": matches}
     relationships = []
     for record in records:
@@ -1327,9 +1326,6 @@ def decide(pkg, trace=None):
     attempts = []
 
     def finish(decision, parser):
-        for field in decision.get("unresolvedFacts", []):
-            if field in ("vendorName", "invoiceNumber") and decision["facts"][field] == "unknown":
-                decision["facts"][field] = MISSING_IDENTITY_MARKER
         if trace is not None:
             try:
                 trace.update(_decision_trace(pkg, decision, parser, attempts))

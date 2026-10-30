@@ -1,4 +1,4 @@
-"""Trial B changes only explicit missing-identity markers, with v32 rationales."""
+"""Trial C removes only the missing-identity footer from v32 rationales."""
 import importlib.util
 import itertools
 from pathlib import Path
@@ -13,7 +13,16 @@ q10 = fixtures.q10
 
 
 def baseline_decision(package):
-    with patch.object(q10, "MISSING_IDENTITY_MARKER", "unknown"):
+    helper = q10._relationship_rationale
+
+    def with_footer(action, facts, current_order, evidence, details, sources):
+        rationale = helper(action, facts, current_order, evidence, details, sources)
+        missing = [field for field in ("vendorName", "invoiceNumber") if facts[field] == "unknown"]
+        if missing:
+            rationale += " Missing source fields: " + ", ".join(missing) + "; unknown is not an inferred identity."
+        return rationale
+
+    with patch.object(q10, "_relationship_rationale", with_footer):
         return q10.decide(package)
 
 
@@ -42,19 +51,22 @@ def semantic_package(*, bank_location=None, bank_status="confirmed"):
         {"name": f"current-{i}.txt", "text": f"[R_SOURCE{i}] {text}"} for i, text in enumerate(texts)]}
 
 
-class MissingIdentityTrialTests(unittest.TestCase):
-    def assert_marker_only(self, baseline, trial):
+class MissingIdentityFooterTests(unittest.TestCase):
+    def assert_footer_only(self, baseline, trial):
         self.assertEqual(set(trial), set(baseline))
-        self.assertEqual({key: value for key, value in trial.items() if key != "facts"},
-                         {key: value for key, value in baseline.items() if key != "facts"})
-        expected = dict(baseline["facts"])
-        for field in baseline.get("unresolvedFacts", []):
-            self.assertEqual(expected[field], "unknown")
-            expected[field] = "not provided"
-        self.assertEqual(trial["facts"], expected)
+        self.assertEqual({key: value for key, value in trial.items() if key != "rationale"},
+                         {key: value for key, value in baseline.items() if key != "rationale"})
+        missing = baseline.get("unresolvedFacts", [])
+        if missing:
+            footer = " Missing source fields: " + ", ".join(missing) + "; unknown is not an inferred identity."
+            self.assertTrue(baseline["rationale"].endswith(footer))
+            self.assertEqual(trial["rationale"], baseline["rationale"][:-len(footer)])
+            for field in missing:
+                self.assertEqual(trial["facts"][field], "unknown")
+        else:
+            self.assertEqual(trial, baseline)
 
-    def test_incomplete_decisions_change_only_missing_identity_fields(self):
-        self.assertEqual(q10.MISSING_IDENTITY_MARKER, "not provided")
+    def test_incomplete_decisions_change_only_rationale_footer(self):
         for action in q10.ACTIONS:
             for currency in ("USD", "EUR", "INR", "JPY", "KWD"):
                 with self.subTest(action=action, currency=currency):
@@ -63,7 +75,7 @@ class MissingIdentityTrialTests(unittest.TestCase):
                                                        currency=currency)
                     baseline, trial = baseline_decision(package), q10.decide(package)
                     self.assertEqual(trial["action"], action)
-                    self.assert_marker_only(baseline, trial)
+                    self.assert_footer_only(baseline, trial)
                     for ref in trial["evidenceRefs"]:
                         self.assertEqual(trial["rationale"].count(ref + ': "'), 1)
 
@@ -82,7 +94,7 @@ class MissingIdentityTrialTests(unittest.TestCase):
             with self.subTest(action=action):
                 package = fixtures.invoice_package(action, "199.99" if action == "request_approval" else "250.00")
                 decision = q10.decide(package)
-                self.assertEqual(decision["rationale"], baseline_decision(package)["rationale"])
+                self.assert_footer_only(baseline_decision(package), decision)
                 for index, document in enumerate(package["documents"][:3]):
                     source = document["text"].split("] ", 1)[1]
                     self.assertEqual(fixtures.citation_text(decision["rationale"], f"R_SOURCE{index}"), source)
@@ -96,11 +108,11 @@ class MissingIdentityTrialTests(unittest.TestCase):
                 decision = q10.decide(package, trace)
                 self.assertEqual(trace["parser"], "semantic")
                 self.assertEqual(decision["action"], "settle_invoice")
-                self.assertEqual(decision["facts"]["invoiceNumber"], "not provided")
+                self.assertEqual(decision["facts"]["invoiceNumber"], "unknown")
                 for index in range(3):
                     citation = fixtures.citation_text(decision["rationale"], f"R_SOURCE{index}")
                     self.assertEqual("callback is confirmed" in citation, index == location)
-                self.assert_marker_only(baseline_decision(package), decision)
+                self.assert_footer_only(baseline_decision(package), decision)
 
     def test_absent_or_pending_confirmation_is_not_invented(self):
         cases = [semantic_package()]
@@ -111,7 +123,7 @@ class MissingIdentityTrialTests(unittest.TestCase):
                 decision = q10.decide(package)
                 self.assertNotIn("callback is confirmed.", decision["rationale"])
                 self.assertNotIn("receiving entry confirms", decision["rationale"])
-                self.assert_marker_only(baseline_decision(package), decision)
+                self.assert_footer_only(baseline_decision(package), decision)
 
     def test_semantic_output_ignores_namespaces_and_document_order(self):
         package = semantic_package(bank_location=1)
@@ -126,30 +138,30 @@ class MissingIdentityTrialTests(unittest.TestCase):
             self.assertEqual(renamed[field], expected[field])
         self.assertEqual(renamed["evidenceRefs"], [f"R_FRESH{i}" for i in range(3)])
         self.assertNotIn("R_SOURCE", renamed["rationale"])
-        self.assert_marker_only(baseline_decision(package), renamed)
+        self.assert_footer_only(baseline_decision(package), renamed)
 
     def test_long_rationale_keeps_baseline_length_and_source_prefixes(self):
         package = fixtures.invoice_package()
         for document in package["documents"]:
             document["text"] = document["text"].replace("PO-CURRENT", "PO-" + "X" * 800)
         baseline, trial = baseline_decision(package), q10.decide(package)
-        self.assert_marker_only(baseline, trial)
+        self.assert_footer_only(baseline, trial)
         self.assertTrue(60 <= len(trial["rationale"]) <= 1500)
         for ref in trial["evidenceRefs"]:
             self.assertIn(ref + ': "', trial["rationale"])
 
-    def test_trace_records_actual_marker_and_unresolved_provenance(self):
+    def test_trace_records_unknown_and_unresolved_provenance(self):
         for action, field in (("settle_invoice", "invoiceNumber"), ("hold_invoice", "vendorName")):
             with self.subTest(action=action):
                 trace = {}
                 decision = q10.decide(fixtures.invoice_package(action), trace)
                 self.assertEqual(trace["decision"], decision)
                 self.assertEqual(trace["factProvenance"][field],
-                                 {"value": "not provided", "status": "unresolved", "sources": []})
+                                 {"value": "unknown", "status": "unresolved", "sources": []})
                 self.assertIn("unresolved_" + field, trace["warnings"])
                 self.assertFalse(trace["hiddenGraderAcceptanceKnown"])
 
-    def test_both_missing_identities_use_marker_without_changing_action(self):
+    def test_both_missing_identities_keep_unknown_without_changing_action(self):
         package = {"packageId": "pkg-both-missing", "documents": [
             {"name": "order.txt", "text": "[R_ORDER01] Signed purchase order PO-NONE-1 totals USD 200.00; submitted invoice total is USD 200.00."},
             {"name": "bank.txt", "text": "[R_BANK001] The account changed from AC-OLD to AC-NEW; callback is not yet verified."},
@@ -157,7 +169,20 @@ class MissingIdentityTrialTests(unittest.TestCase):
         decision = q10.decide(package)
         self.assertEqual(decision["action"], "hold_invoice")
         self.assertEqual(decision["unresolvedFacts"], ["vendorName", "invoiceNumber"])
-        self.assert_marker_only(baseline_decision(package), decision)
+        self.assert_footer_only(baseline_decision(package), decision)
+
+
+    def test_footer_text_inside_a_source_quotation_is_preserved(self):
+        facts = {"vendorName": "unknown", "invoiceNumber": "INV-TEST-1", "amountMinor": 20000, "currency": "USD"}
+        refs = ["R_SOURCE0", "R_SOURCE1", "R_SOURCE2"]
+        sources = {"R_SOURCE0": "Signed record. Missing source fields: vendorName; unknown is not an inferred identity.",
+                   "R_SOURCE1": "Remittance changed; callback awaits verification.",
+                   "R_SOURCE2": "Payment controls require a hold until verification completes."}
+        rationale = q10._relationship_rationale("hold_invoice", facts, "PO-CURRENT", refs, {}, sources)
+        for ref in refs:
+            self.assertIn(f'{ref}: "{sources[ref]}".', rationale)
+        self.assertTrue(rationale.endswith('R_SOURCE2: "' + sources["R_SOURCE2"] + '".'))
+        self.assertEqual(rationale.count("Missing source fields:"), 1)
 
 
 if __name__ == "__main__":

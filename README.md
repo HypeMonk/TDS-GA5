@@ -4,7 +4,7 @@ A single FastAPI deployment for the assignment endpoints. The Q2–Q4 agent path
 
 ## Offline decision model
 
-- **Invoice/A2A:** extracts commercial names, invoice numbers, amounts, payment/order relationships, authority limits, bank verification, and exactly three controlling references. A purchase-order identifier is not an invoice number, and a bank-account identifier is not a vendor name. When the required name or invoice number is absent, Trial B returns the explicit marker `not provided` and records the unresolved field rather than inventing or substituting a different identity.
+- **Invoice/A2A:** extracts commercial names, invoice numbers, amounts, payment/order relationships, authority limits, bank verification, and exactly three controlling references. A purchase-order identifier is not an invoice number, and a bank-account identifier is not a vendor name. When the required name or invoice number is absent, the solver returns `unknown` and records the unresolved field rather than inventing or substituting a different identity.
 - **Mailroom:** selects actions from source kind, provenance, current authenticated state, signed scope, exact request identity, and least privilege. Standing approvals and request-controlled notices are handled separately. Contradictory or unsupported evidence returns HTTP 422 without a model call.
 - **Incident response:** classifies unique positive causal relations, validates catalog-bound arguments, evaluates bounded numeric/Boolean operating rules, enforces approval gates, and persists receipt-driven state and OTLP topology.
 
@@ -22,9 +22,11 @@ The grading blocker needs clarification: should a missing identity be included i
 
 Trial A (`offline-v33-a`) tested concise, bracket-cited rationale while preserving v32 facts. The retained feedback was still business 3.33/3.50; its captured missing-vendor hold and missing-invoice settlement proposals both remained rejected. This is not evidence that every possible rationale format was tested.
 
-Trial B (`offline-v34-b`) restores the `offline-v32` source-quotation rationale and changes only genuinely unresolved `facts.invoiceNumber` or `facts.vendorName` from `unknown` to `not provided`. Existing names and invoice numbers, actions, amounts, currencies, evidence arrays, and unresolved-field lists remain unchanged. Conversion happens after rationale construction, so the rationale is byte-for-byte identical to v32, including its description of unknown identities. Diagnostic traces record the marker actually returned and still classify those fields as unresolved. This release does not combine Trial A's rationale changes with Trial B's marker change.
+Trial B (`offline-v34-b`) tested `not provided` instead of `unknown`, retaining the exact v32 rationale. Its feedback remained partial (business 3.29/3.50); the captured missing-invoice approval and settlement cases and missing-vendor hold case were rejected. The different audit mix does not establish that the marker itself lowered the score.
 
-Use the isolated Q2 service from `fix/q2-source-identities`, not production `main`. A branch push can auto-deploy that test service if Render auto-deploy is enabled. Keep its root URL unchanged between trials, export the audit outcomes before another deployment, and evaluate acceptance of the previously failing audit shape rather than just the rounded score. Local tests and replay do not establish a new grader score; `not provided` is an experimental representation, not a known accepted sentinel.
+Trial C (`offline-v35-c`) returns to v32's `unknown` facts and detailed source quotations, removing only the appended `Missing source fields: ...; unknown is not an inferred identity.` sentence from incomplete-case rationales. Actions, facts, currencies, amounts, evidence arrays, and unresolved-field lists are identical to v32. The original excerpt budget is retained, so removing the footer does not change the quoted evidence or its truncation. Source text that happens to contain the same phrase is not removed. Complete-identity proposals and diagnostic missing-field warnings are unchanged.
+
+Use the isolated Q2 service from `fix/q2-source-identities`, not production `main`. A branch push can auto-deploy that test service if Render auto-deploy is enabled. Keep its root URL unchanged between trials, export the audit outcomes before another deployment, and evaluate acceptance of the previously failing audit shape rather than just the rounded score. Local tests and replay do not establish a new grader score.
 
 ## Q4 Render audit wording fix
 
@@ -54,7 +56,7 @@ Keep one base URL for a controlled test. A lower score on a separate Check does 
 
 ## Health and diagnostics
 
-- `/health` — readiness and version (`offline-v34-b`)
+- `/health` — readiness and version (`offline-v35-c`)
 - `/debug/q9` — redacted durable Q3 proposal records
 - `/debug/q9/commitwire` — redacted Q3 receipt/outcome records
 - `/debug/q10` — redacted recent Q2 HTTP records
