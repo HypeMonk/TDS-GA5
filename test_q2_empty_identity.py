@@ -74,7 +74,8 @@ class EmptyIdentityTests(unittest.TestCase):
         before = baseline(package)
         self.assertEqual(trace["parser"], "semantic")
         self.assertEqual(after["facts"]["invoiceNumber"], "")
-        before["facts"]["invoiceNumber"] = ""
+        for field in before["unresolvedFacts"]:
+            before["facts"][field] = ""
         self.assertEqual(after, before)
         self.assertNotIn("Missing source fields:", after["rationale"])
 

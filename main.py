@@ -17,8 +17,12 @@ from collections import deque
 # Import Q8 - Q11 routers
 from q8 import router as q8_router
 from q9 import router as q9_router
-from q10 import router as q10_router, SOLVER_VERSION
+import q10
+from q10_variants import VariantSuite
 from q11 import router as q11_router
+
+Q2_SUITE = VariantSuite(q10)
+SOLVER_VERSION = Q2_SUITE.instances["baseline"].SOLVER_VERSION
 
 app = FastAPI(title="GA-5 Universal Solver Monolith")
 
@@ -101,12 +105,21 @@ def _debug_authorized(request: Request) -> bool:
     return bool(_DEBUG_KEY and supplied and hmac.compare_digest(
         supplied.encode("utf-8"), _DEBUG_KEY.encode("utf-8")))
 
+def _variant_log(entry, variant_id, path):
+    return {"timestamp": entry["timestamp"], "variantId": variant_id,
+            "configDigest": Q2_SUITE.instances[variant_id]._CONFIG_DIGEST,
+            "method": entry["method"], "path": path, "status_code": entry["status_code"],
+            "duration_ms": entry["duration_ms"], "failed": entry.get("error") is not None}
+
+
 # ==============================================================================
 # Middleware for Request Logging and Route-Based Log Partitioning
 # ==============================================================================
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    public_path = request.url.path
+    variant_id = Q2_SUITE.variant_for_path(public_path)
     body_bytes = b""
     if request.method in ("POST", "PUT", "PATCH"):
         try:
@@ -135,13 +148,17 @@ async def log_requests(request: Request, call_next):
             "duration_ms": round((time.time() - start_time) * 1000, 2),
             "error": str(e)
         }
-        if "/q3" in request.url.path:
+        if variant_id:
+            Q2_SUITE.logs[variant_id].append(_variant_log(log_entry, variant_id, public_path))
+        elif public_path.startswith("/debug/q10/variants"):
+            pass
+        elif "/q3" in request.url.path:
             LOGS_Q3.append(log_entry)
         elif "/q8" in request.url.path:
             LOGS_Q8.append(log_entry)
         elif "/q9" in request.url.path or "mailroom" in request.url.path:
             LOGS_Q9.append(log_entry)
-        elif "/q10" in request.url.path or "agent-card" in request.url.path:
+        elif "/q10" in request.url.path or "agent-card" in request.url.path or "/a2a" in request.url.path or "/message:send" in request.url.path or "/tasks" in request.url.path:
             LOGS_Q10.append(log_entry)
         elif "/q11" in request.url.path:
             LOGS_Q11.append(log_entry)
@@ -157,7 +174,7 @@ async def log_requests(request: Request, call_next):
     # and the /debug endpoints themselves (avoid logging our own log dumps).
     path = request.url.path
     resp_body_str = None
-    _skip_capture = ("/mcp" in path) or path.startswith("/debug")
+    _skip_capture = bool(variant_id) or ("/mcp" in path) or path.startswith("/debug")
     if not _skip_capture:
         try:
             resp_chunks = []
@@ -187,7 +204,11 @@ async def log_requests(request: Request, call_next):
     }
     
     path = request.url.path
-    if "/q3" in path:
+    if variant_id:
+        Q2_SUITE.logs[variant_id].append(_variant_log(log_entry, variant_id, public_path))
+    elif path.startswith("/debug/q10/variants"):
+        pass
+    elif "/q3" in path:
         LOGS_Q3.append(log_entry)
     elif "/q8" in path:
         LOGS_Q8.append(log_entry)
@@ -765,7 +786,7 @@ LXD_SANDBOX_END token={q7["token"]}
 
 app.include_router(q8_router)
 app.include_router(q9_router)
-app.include_router(q10_router)
+Q2_SUITE.register(app)
 app.include_router(q11_router)
 
 # ==============================================================================

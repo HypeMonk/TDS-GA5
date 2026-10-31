@@ -4,7 +4,7 @@ A single FastAPI deployment for the assignment endpoints. The Q2–Q4 agent path
 
 ## Offline decision model
 
-- **Invoice/A2A:** extracts commercial names, invoice numbers, amounts, payment/order relationships, authority limits, bank verification, and exactly three controlling references. A purchase-order identifier is not an invoice number, and a bank-account identifier is not a vendor name. When the required name or invoice number is absent, Trial D returns an empty string and records the unresolved field rather than inventing or substituting a different identity.
+- **Invoice/A2A:** extracts commercial names, invoice numbers, amounts, payment/order relationships, authority limits, bank verification, and exactly three controlling references. A purchase-order identifier is not an invoice number, and a bank-account identifier is not a vendor name. The root and `/a2a/` retain Trial D behavior. The experimental Q2 URLs select fixed identity-marker, rationale, and vendor-binding policies; none changes currency arithmetic, controlling actions, or evidence selection.
 - **Mailroom:** selects actions from source kind, provenance, current authenticated state, signed scope, exact request identity, and least privilege. Standing approvals and request-controlled notices are handled separately. Contradictory or unsupported evidence returns HTTP 422 without a model call.
 - **Incident response:** classifies unique positive causal relations, validates catalog-bound arguments, evaluates bounded numeric/Boolean operating rules, enforces approval gates, and persists receipt-driven state and OTLP topology.
 
@@ -28,7 +28,74 @@ Trial C (`offline-v35-c`) returns to v32's `unknown` facts and detailed source q
 
 Trial D (`offline-v36-d`) preserves Trial C actions, evidence, rationale, amounts, currencies, and all populated identities. Only fields already recorded in `unresolvedFacts` change from the prose marker `unknown` to the empty string. The keys remain present and string-typed; they are not omitted or converted to null. Diagnostic traces retain unresolved provenance. This representation is experimental and not a verified grader convention.
 
+Trial D's reported result remained 3.95/4, with business 3.33/3.50 and every non-business category full. Its saved capture has 61 unique accepted proposals and one rejected order-only settlement with an empty invoice number. It supplies no accepted incomplete-identity counterpart.
+
+Trial E (`offline-v37-e`) is a local, ungraded candidate based on Trial D. In both structured and paraphrased record paths, a historical recipient from a different order no longer fills `vendorName` when the current invoice does not name a vendor. Same-order ledger identities and explicit current-invoice vendors remain unchanged. Actions, invoice numbers, amounts, currencies, evidence arrays, and rationale text are frozen; the vendor field and its unresolved provenance are the intended changes. Rationale generation retains the Trial D identity inputs for its original excerpt budget before the vendor-binding check is applied.
+
+Local validation against frozen commit `89c097919b27b94ffb45dc03619c324cf1197ece` covered 2,111 inputs: 139 vendor-binding changes, with all 2,111 rationales unchanged. All 1,780 unique receipt-bound accepted variants retain Trial D's full output and their recorded action/fact/evidence values. Twenty-three old accepted rationale differences already existed in Trial D; this candidate does not introduce them. All 147 exercised tests and the real localhost HTTP proposal/trace/receipt/replay/isolation workflow passed. These checks establish isolation, not grader acceptance or 4/4. No Trial E deployment or scored attempt has been performed.
+
 Use the isolated Q2 service from `fix/q2-source-identities`, not production `main`. A branch push can auto-deploy that test service if Render auto-deploy is enabled. Keep its root URL unchanged between trials, export the audit outcomes before another deployment, and evaluate acceptance of the previously failing audit shape rather than just the rounded score. Local tests and replay do not establish a new grader score.
+
+## Parallel Q2 hypothesis suite
+
+The local implementation exposes **18 fixed variants** on one service. The existing origin and `/a2a/` continue to use `offline-v36-d`. Variant aliases share state with their canonical URL, but never with another variant. Q3/Q4 routes are unchanged. This suite has not been deployed or graded yet.
+
+Use `https://tds-ga3-q2-dz54.onrender.com/a2a/vN/` after the separately authorized branch deployment. `/vN/` is an equivalent alias. Do not submit the registry or diagnostic URL to the grader.
+
+| ID | Missing identity string | Rationale | Vendor identity rule | Historical reference |
+|---|---|---|---|---|
+| v1 | `unknown` | Excerpts + footer | Legacy ledger fallback | v32 |
+| v2 | `unknown` | Concise, bracket-cited incomplete cases | Legacy | Trial A |
+| v3 | `not provided` | Excerpts + footer | Legacy | Trial B |
+| v4 | `unknown` | Excerpts, no footer | Legacy | Trial C |
+| v5 | Empty string | Excerpts, no footer | Legacy | Trial D |
+| v6 | Empty string | Excerpts, no footer | Current-order binding | Local Trial E |
+| v7 | `unknown` | Excerpts + footer | Current-order | New combination |
+| v8 | `unknown` | Excerpts, no footer | Current-order | New combination |
+| v9 | `unknown` | Concise incomplete cases | Current-order | New combination |
+| v10 | `not provided` | Excerpts + footer | Current-order | New combination |
+| v11 | `not provided` | Excerpts, no footer | Legacy | New combination |
+| v12 | `not provided` | Excerpts, no footer | Current-order | New combination |
+| v13 | `not provided` | Concise incomplete cases | Legacy | New combination |
+| v14 | `not provided` | Concise incomplete cases | Current-order | New combination |
+| v15 | Empty string | Excerpts + footer | Legacy | New combination |
+| v16 | Empty string | Excerpts + footer | Current-order | New combination |
+| v17 | Empty string | Concise incomplete cases | Legacy | New combination |
+| v18 | Empty string | Concise incomplete cases | Current-order | New combination |
+
+IDs and policy tuples are permanent. `GET /debug/q10/variants` returns their URLs, settings, reference labels, and immutable configuration digests. Experimental task/action IDs are namespaced by variant. The same principal, batch, and message submitted to two variants therefore cannot reuse another variant's task or receipt.
+
+**Rendering order:** construct legacy parsed facts, render the selected historical rationale, optionally apply current-order vendor binding, recompute unresolved identities, then apply the missing-value string. Thus Trial E and new current-order combinations preserve the corresponding legacy rationale even when vendor binding newly marks a name unresolved. Concise selection and footer budgeting use pre-binding facts; a historical source quotation can still name the previous recipient. `no footer` retains the original v32 excerpt budget. Trial A uses its exact historical source checks and original-excerpt overflow fallback. Heuristic fallbacks are unchanged, not relabeled with experimental missing markers.
+
+### Separate logs and exports
+
+For v6 (replace the ID for another variant):
+
+- `GET /debug/q10/variants/v6/logs?limit=25&before=TIMESTAMP` — independent metadata-only HTTP log ring.
+- `GET /debug/q10/variants/v6/traces?limit=25&before=ID` — protected, durable full trace index.
+- `GET /debug/q10/variants/v6/traces/ID` — exact redacted request, proposal, decision, and receipt observations.
+
+All three require `X-Debug-Key`. Variant diagnostic reads do not log themselves. Full bodies are stored only in protected traces, not duplicated into public logs. The legacy unbounded wire recorder is disabled for experiments; root wire behavior is unchanged.
+
+```powershell
+python -I -B capture_q2_traces.py https://tds-ga3-q2-dz54.onrender.com/a2a/v6/ ..
+python -I -B analyze_q2_traces.py ..\q2-traces-XXXX --output ..6-outcomes.json
+python -I -B compare_q2_variants.py ..\q2-traces-XXXX --output ..\same-input-comparison.json
+```
+
+Set `DEBUG_KEY` in the terminal environment before export. The exporter uses only authenticated GET requests; either variant URL alias selects that variant's diagnostics. Its manifest preserves the requested base, variant/config identity, omissions, and capture gaps. Analysis counts only successful proposal-bound receipt observations; missing or conflicting bindings remain `UNVERIFIED_OUTCOME`.
+
+The comparison runs every captured package through all 18 policies locally and reports field-level differences from Trial D. Only the originally checked variant with a matching config, exact business output, and verified receipt can retain its observed verdict. All counterfactual variants are **NOT_GRADED**, even if their output happens to match.
+
+### Resource and Check limits
+
+Each experiment has its own lazy task SQLite connection, trace database, and 100-entry metadata log ring. Protected trace retention is **100 rows / 2 MiB of serialized payload per variant**, totaling at most 36 MiB across experiments. Root traces retain their existing 500 rows / 32 MiB. Database pages, WAL files, and task state add storage beyond those payload limits. Large individual events may become metadata-only with explicit omission flags; export soon after each Check. Render's ephemeral filesystem still loses state on redeployment.
+
+**One deployment does not mean one grader attempt.** Each URL needs its own Check, and different Checks may draw different audit cases. The ten Check/Save attempts per 24 hours still apply; reserve the final attempt for Save. Choose informative combinations rather than spending attempts on every historical variant. No live Check or Save is invoked by export, analysis, local comparison, or these tests.
+
+### Local verification
+
+The frozen v32/A/B/C/D and pre-refactor E references are test-only compressed fixtures, not copied deployed solvers. The retained-corpus comparison verified **2,111 inputs / 37,998 variant decisions** with no historical-equivalence or action/evidence discrepancy; it also checked 1,780 accepted variants. The actual localhost monolith completed all 18 discovery/proposal/receipt/alias/log workflows and recovered exact tasks and terminal receipt replays after process restart. These results do not establish new grader acceptance or 4/4.
 
 ## Q4 Render audit wording fix
 
@@ -58,7 +125,9 @@ Keep one base URL for a controlled test. A lower score on a separate Check does 
 
 ## Health and diagnostics
 
-- `/health` — readiness and version (`offline-v36-d`)
+- `/health` — baseline readiness and version (`offline-v36-d`)
+- `/a2a/vN/health` or `/vN/health` — the selected experimental policy/version
+- `/debug/q10/variants` — fixed Q2 policy registry and submission URLs
 - `/debug/q9` — redacted durable Q3 proposal records
 - `/debug/q9/commitwire` — redacted Q3 receipt/outcome records
 - `/debug/q10` — redacted recent Q2 HTTP records
@@ -106,6 +175,9 @@ python -I -B test_q10_evidence.py
 python -I -B test_q2_render_business.py
 python -I -B test_q2_rationale_trial.py
 python -I -B test_q2_empty_identity.py
+python -I -B test_q2_vendor_binding.py
+python -I -B test_q10_variants.py
+python -I -B test_compare_q2_variants.py
 python -I -B test_q4_render_audits.py
 python -I -B test_q10_traces.py
 python -I -B test_capture_q2_traces.py

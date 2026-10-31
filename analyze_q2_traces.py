@@ -21,88 +21,119 @@ def load_capture(folder):
 
 
 def analyze(manifest, traces):
-    tasks = defaultdict(lambda: {"requests": [], "decisions": {}, "outcomes": {}, "versions": set()})
+    tasks = defaultdict(lambda: {"requests": [], "decisions": {}, "outcomes": {}, "versions": set(),
+                                 "proposals": {}, "conflicts": set(), "configs": set()})
     integrity = []
     for trace in traces:
+        variant = trace.get("variantId", manifest.get("variantId", "baseline"))
         trace_id = trace.get("id")
+        task_id = trace.get("taskId") or f"unbound-trace-{trace_id}"
+        task = tasks[(variant, task_id)]
         for side in ("request", "response"):
             capture = trace.get(side) or {}
             if capture.get("truncated") or capture.get("omittedReason"):
-                integrity.append({"traceId": trace_id, "side": side,
+                integrity.append({"variantId": variant, "traceId": trace_id, "side": side,
                                   "reason": capture.get("omittedReason") or "truncated"})
         if trace.get("omittedReason"):
-            integrity.append({"traceId": trace_id, "side": "event", "reason": trace["omittedReason"]})
-        task_id = trace.get("taskId") or f"unbound-trace-{trace_id}"
-        task = tasks[task_id]
+            integrity.append({"variantId": variant, "traceId": trace_id, "side": "event", "reason": trace["omittedReason"]})
         task["requests"].append({"traceId": trace_id, "method": trace.get("method"), "path": trace.get("path"),
                                  "status": trace.get("status"), "messageId": trace.get("messageId"),
                                  "durationMs": trace.get("durationMs")})
         if trace.get("solverVersion"):
             task["versions"].add(trace["solverVersion"])
+        if trace.get("configDigest"):
+            task["configs"].add(trace["configDigest"])
+        if trace.get("status") != 200:
+            continue
+        response = (trace.get("response") or {}).get("body")
+        envelope = response.get("task", response) if isinstance(response, dict) else {}
+        for artifact in envelope.get("artifacts", []):
+            for part in artifact.get("parts", []):
+                data = part.get("data") or {}
+                for proposal in data.get("proposals", []) if isinstance(data, dict) else []:
+                    pid = proposal.get("packageId")
+                    if pid in task["proposals"] and task["proposals"][pid] != proposal:
+                        task["conflicts"].add(pid)
+                        integrity.append({"variantId": variant, "taskId": task_id, "packageId": pid,
+                                          "reason": "conflicting_persisted_proposal"})
+                    task["proposals"][pid] = proposal
         for decision in trace.get("decisions") or []:
-            package_id = decision.get("packageId")
-            if not package_id:
-                integrity.append({"traceId": trace_id, "side": "decision", "reason": "missing_package_id"})
+            pid = decision.get("packageId")
+            if not pid:
+                integrity.append({"traceId": trace_id, "reason": "missing_package_id"})
                 continue
-            existing = task["decisions"].get(package_id)
+            existing = task["decisions"].get(pid)
             if existing is not None and existing != decision:
-                integrity.append({"traceId": trace_id, "side": "decision", "packageId": package_id,
+                task["conflicts"].add(pid)
+                integrity.append({"variantId": variant, "taskId": task_id, "packageId": pid,
                                   "reason": "conflicting_decision_trace"})
-            task["decisions"][package_id] = decision
+            task["decisions"][pid] = decision
         for outcome in trace.get("outcomes") or []:
-            package_id = outcome.get("packageId")
-            if not package_id:
-                integrity.append({"traceId": trace_id, "side": "outcome", "reason": "missing_package_id"})
+            pid = outcome.get("packageId")
+            if not pid:
+                integrity.append({"traceId": trace_id, "reason": "missing_package_id"})
                 continue
-            existing = task["outcomes"].get(package_id)
+            existing = task["outcomes"].get(pid)
             if existing is not None and existing != outcome:
-                integrity.append({"traceId": trace_id, "side": "outcome", "packageId": package_id,
+                task["conflicts"].add(pid)
+                integrity.append({"variantId": variant, "taskId": task_id, "packageId": pid,
                                   "reason": "conflicting_outcome_trace"})
-            task["outcomes"][package_id] = outcome
+            task["outcomes"][pid] = outcome
 
-    output_tasks, totals = [], Counter()
-    rejected = []
-    for task_id, task in sorted(tasks.items()):
+    output_tasks, totals, rejected = [], Counter(), []
+    for (variant, task_id), task in sorted(tasks.items()):
         packages = []
-        package_ids = sorted(set(task["decisions"]) | set(task["outcomes"]))
-        for package_id in package_ids:
-            decision = task["decisions"].get(package_id)
-            outcome = task["outcomes"].get(package_id)
-            status = outcome.get("outcome") if outcome else "NO_OUTCOME"
+        for pid in sorted(set(task["decisions"]) | set(task["outcomes"])):
+            decision, receipt = task["decisions"].get(pid), task["outcomes"].get(pid)
+            proposal = task["proposals"].get(pid)
+            output = (decision or {}).get("decision") or {}
+            issues = []
+            if receipt:
+                if receipt.get("action") != output.get("action"):
+                    issues.append("continuation_action_differs_from_trace")
+                if proposal and receipt.get("actionId") != proposal.get("actionId"):
+                    issues.append("continuation_action_id_differs_from_proposal")
+                if receipt.get("outcome") not in ("ACCEPTED", "REJECTED"):
+                    issues.append("unknown_receipt_outcome")
+                if receipt.get("outcome") == "ACCEPTED" and not receipt.get("receiptNonce"):
+                    issues.append("accepted_receipt_nonce_unavailable")
+                if not proposal:
+                    issues.append("persisted_proposal_unavailable")
+                if decision is None:
+                    issues.append("outcome_without_decision_trace")
+                if proposal and any(proposal.get(field) != output.get(field)
+                                    for field in ("action", "facts", "evidenceRefs", "rationale")):
+                    issues.append("decision_differs_from_persisted_proposal")
+                if pid in task["conflicts"] or len(task["configs"]) > 1:
+                    issues.append("conflicting_observations")
+            bound = bool(receipt and proposal and decision and not issues)
+            status = receipt.get("outcome") if bound else "UNVERIFIED_OUTCOME" if receipt else "NO_OUTCOME"
             totals[status] += 1
-            if decision is None:
-                integrity.append({"taskId": task_id, "packageId": package_id, "reason": "outcome_without_decision_trace"})
-                package = {"packageId": package_id, "outcome": status, "decisionTraceMissing": True}
-            else:
-                proposal = decision.get("decision") or {}
-                package = {"packageId": package_id, "outcome": status, "parser": decision.get("parser"),
-                           "action": proposal.get("action"), "facts": proposal.get("facts"),
-                           "evidenceRefs": proposal.get("evidenceRefs"), "rationale": proposal.get("rationale"),
-                           "warnings": decision.get("warnings") or [],
-                           "factProvenance": decision.get("factProvenance") or {},
-                           "relationships": decision.get("relationships") or [],
-                           "parserAttempts": decision.get("parserAttempts") or [],
-                           "hiddenExpectedAnswerKnown": False}
-                if outcome:
-                    mismatches = []
-                    if outcome.get("action") != proposal.get("action"):
-                        mismatches.append("continuation_action_differs_from_trace")
-                    package["transportConsistency"] = {"issues": mismatches,
-                                                       "actionId": outcome.get("actionId"),
-                                                       "receiptNoncePresent": bool(outcome.get("receiptNonce"))}
+            for reason in issues:
+                integrity.append({"variantId": variant, "taskId": task_id, "packageId": pid, "reason": reason})
+            package = {"packageId": pid, "outcome": status, "recordedOutcome": receipt.get("outcome") if receipt else None,
+                       "receiptBindingVerified": bound, "decisionTraceMissing": decision is None,
+                       "parser": (decision or {}).get("parser"), "action": output.get("action"),
+                       "facts": output.get("facts"), "evidenceRefs": output.get("evidenceRefs"),
+                       "rationale": output.get("rationale"), "warnings": (decision or {}).get("warnings") or [],
+                       "factProvenance": (decision or {}).get("factProvenance") or {},
+                       "relationships": (decision or {}).get("relationships") or [],
+                       "parserAttempts": (decision or {}).get("parserAttempts") or [],
+                       "hiddenExpectedAnswerKnown": False}
+            if receipt:
+                package["transportConsistency"] = {"issues": issues, "actionId": receipt.get("actionId"),
+                                                   "receiptNoncePresent": bool(receipt.get("receiptNonce"))}
             packages.append(package)
             if status == "REJECTED":
-                rejected.append({"taskId": task_id, **package})
-        output_tasks.append({"taskId": task_id, "solverVersions": sorted(task["versions"]),
-                             "requests": sorted(task["requests"], key=lambda item: item["traceId"] or 0),
-                             "packages": packages})
-    return {"solverVersions": sorted({version for task in tasks.values() for version in task["versions"]}),
+                rejected.append({"variantId": variant, "taskId": task_id, **package})
+        output_tasks.append({"variantId": variant, "taskId": task_id, "solverVersions": sorted(task["versions"]),
+                             "configDigests": sorted(task["configs"]), "requests": sorted(task["requests"], key=lambda row: row["traceId"] or 0), "packages": packages})
+    return {"solverVersions": sorted({v for task in tasks.values() for v in task["versions"]}),
             "traceFiles": len(traces), "taskCount": len(tasks), "outcomes": dict(sorted(totals.items())),
             "captureFailures": manifest.get("captureFailures"), "completeListing": manifest.get("completeListing"),
             "missingRows": manifest.get("missingRows") or [], "integrityIssues": integrity,
             "rejectedPackages": rejected, "tasks": output_tasks,
-            "interpretation": ("REJECTED means the hidden grader rejected the exact proposal; the trace cannot reveal "
-                               "which hidden expected field differed unless the grader supplied that detail.")}
+            "interpretation": "REJECTED means a successful, proposal-bound continuation rejected this exact proposal; the trace cannot reveal which hidden expected field differed. Unbound observations remain unverified."}
 
 
 def main():

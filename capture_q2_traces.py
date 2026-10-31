@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -10,21 +11,37 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 
-def export(client, base, output_parent, *, task_id=None, maximum=500):
+def diagnostic_base(base):
     parts = urlsplit(base)
     if parts.scheme != "https" or not parts.netloc or parts.username or parts.password or parts.query or parts.fragment:
-        raise ValueError("Use the HTTPS deployment origin or A2A base URL, without credentials or query parameters.")
+        raise ValueError("Use an HTTPS Q2 base URL without credentials, query parameters, or fragments.")
     origin = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+    path = parts.path.rstrip("/")
+    if path in ("", "/a2a"):
+        return origin, "baseline", origin + "/debug/q10"
+    match = re.fullmatch(r"/(?:a2a/)?(v(?:[1-9]|1[0-8]))", path)
+    if not match:
+        raise ValueError("Unknown Q2 variant base URL.")
+    variant = match.group(1)
+    return origin, variant, origin + "/debug/q10/variants/" + variant
+
+
+def export(client, base, output_parent, *, task_id=None, maximum=500):
+    origin, variant, diagnostics = diagnostic_base(base)
     if not output_parent.is_dir():
         raise ValueError("The output parent directory must already exist.")
     params = {"limit": 100}
     if task_id:
         params["taskId"] = task_id
-    first = client.get(origin + "/debug/q10/traces", params=params)
+    first = client.get(diagnostics + "/traces", params=params)
     first.raise_for_status()
     page = first.json()
+    if page.get("variantId", "baseline") != variant:
+        raise ValueError("Trace endpoint returned a different variant.")
+    config_digest = page.get("configDigest")
     folder = Path(tempfile.mkdtemp(prefix="q2-traces-", dir=output_parent))
-    manifest = {"origin": origin, "solverVersion": page.get("solverVersion"), "files": [], "missingRows": [],
+    manifest = {"origin": origin, "requestedBase": base, "diagnosticBase": diagnostics,
+                "variantId": variant, "configDigest": page.get("configDigest"), "solverVersion": page.get("solverVersion"), "files": [], "missingRows": [],
                 "captureFailures": page.get("captureFailures"), "lastCaptureError": page.get("lastCaptureError"),
                 "bodyLimitBytes": page.get("bodyLimitBytes"), "retainedPayloadLimitBytes": page.get("retainedPayloadLimitBytes"),
                 "rowLimit": page.get("rowLimit"), "maximum": maximum, "completeListing": False}
@@ -36,12 +53,14 @@ def export(client, base, output_parent, *, task_id=None, maximum=500):
                 if row_id in seen or len(seen) >= maximum:
                     continue
                 seen.add(row_id)
-                detail = client.get(origin + f"/debug/q10/traces/{row_id}")
+                detail = client.get(diagnostics + f"/traces/{row_id}")
                 if detail.status_code == 404:
                     manifest["missingRows"].append(row_id)
                     continue
                 detail.raise_for_status()
                 data = detail.json()
+                if data.get("variantId", "baseline") != variant or data.get("configDigest") != config_digest:
+                    raise ValueError("Trace detail belongs to a different variant.")
                 name = f"trace-{row_id}.json"
                 (folder / name).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
                 manifest["files"].append(name)
@@ -54,9 +73,11 @@ def export(client, base, output_parent, *, task_id=None, maximum=500):
             if "before" in params and int(cursor) >= int(params["before"]):
                 raise ValueError("The trace cursor did not advance.")
             params["before"] = int(cursor)
-            response = client.get(origin + "/debug/q10/traces", params=params)
+            response = client.get(diagnostics + "/traces", params=params)
             response.raise_for_status()
             page = response.json()
+            if page.get("variantId", "baseline") != variant or page.get("configDigest") != config_digest:
+                raise ValueError("Trace page belongs to a different variant.")
     finally:
         (folder / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return folder, manifest

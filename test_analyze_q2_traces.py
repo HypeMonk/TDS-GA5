@@ -25,7 +25,9 @@ class AnalysisTests(unittest.TestCase):
         manifest = {"captureFailures": 0, "completeListing": True, "missingRows": []}
         traces = [
             {"id": 1, "solverVersion": "offline-v20", "taskId": "task-a", "messageId": "start", "method": "POST",
-             "path": "/message:send", "status": 200, "durationMs": 10, "request": {}, "response": {},
+             "path": "/message:send", "status": 200, "durationMs": 10, "request": {}, "response": {"body": {"task": {"artifacts": [{"parts": [{"data": {"proposals": [
+                 {"packageId": "pkg-a", "actionId": "act-a", **decision("pkg-a", "settle_invoice")["decision"]},
+                 {"packageId": "pkg-b", "actionId": "act-b", **decision("pkg-b", "reject_duplicate")["decision"]}]}}]}]}}},
              "decisions": [decision("pkg-a", "settle_invoice", ["unresolved_invoiceNumber"]),
                            decision("pkg-b", "reject_duplicate")], "outcomes": []},
             {"id": 2, "solverVersion": "offline-v20", "taskId": "task-a", "messageId": "results", "method": "POST",
@@ -63,11 +65,31 @@ class AnalysisTests(unittest.TestCase):
         reasons = {issue["reason"] for issue in result["integrityIssues"]}
         self.assertTrue({"body_size_limit", "invalid_json", "conflicting_decision_trace",
                          "outcome_without_decision_trace"}.issubset(reasons))
-        package = next(item for item in result["rejectedPackages"] if item["packageId"] == "pkg-a")
-        self.assertEqual(package["transportConsistency"]["issues"], ["continuation_action_differs_from_trace"])
+        package = next(item for task in result["tasks"] for item in task["packages"] if item["packageId"] == "pkg-a")
+        self.assertIn("continuation_action_differs_from_trace", package["transportConsistency"]["issues"])
+        self.assertEqual(package["outcome"], "UNVERIFIED_OUTCOME")
         self.assertEqual(result["solverVersions"], ["v1", "v2"])
         self.assertFalse(result["completeListing"])
         self.assertEqual(result["missingRows"], [9])
+
+    def test_same_task_ids_different_variants_and_failed_receipts_do_not_mix(self):
+        traces = []
+        for variant, verdict in (("v1", "ACCEPTED"), ("v2", "REJECTED")):
+            traces.append({"id": 1, "variantId": variant, "taskId": "same-task", "status": 200,
+                "decisions": [decision("pkg", "settle_invoice")],
+                "response": {"body": {"task": {"artifacts": [{"parts": [{"data": {"proposals": [
+                    {"packageId": "pkg", "actionId": variant + "-action", **decision("pkg", "settle_invoice")["decision"]}]}}]}]}}}})
+            traces.append({"id": 2, "variantId": variant, "taskId": "same-task", "status": 200,
+                "outcomes": [{"packageId": "pkg", "actionId": variant + "-action", "action": "settle_invoice", "outcome": verdict, "receiptNonce": "nonce"}]})
+        traces.append({"id": 3, "variantId": "v1", "taskId": "same-task", "status": 400,
+            "outcomes": [{"packageId": "pkg", "actionId": "wrong", "action": "settle_invoice", "outcome": "REJECTED"}]})
+        result = analyzer.analyze({}, traces)
+        self.assertEqual(result["taskCount"], 2)
+        self.assertEqual(result["outcomes"], {"ACCEPTED": 1, "REJECTED": 1})
+        self.assertEqual(result["rejectedPackages"][0]["variantId"], "v2")
+        traces[1]["outcomes"][0]["actionId"] = "v2-action"
+        result = analyzer.analyze({}, traces)
+        self.assertEqual(result["outcomes"], {"UNVERIFIED_OUTCOME": 1, "REJECTED": 1})
 
     def test_manifest_loader_rejects_missing_files(self):
         with tempfile.TemporaryDirectory(prefix="q2-analysis-test-") as folder:

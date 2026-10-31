@@ -1,0 +1,26 @@
+{
+  "v1": {
+    "commit": "31a38a4",
+    "sha256": "37822dd6967f94648f81c0b4481c045c3264eab16fd21b311e69943dca5630dc"
+  },
+  "v2": {
+    "commit": "da78bc5",
+    "sha256": "98a37c9bce2aca56ca59dfc73f497b7715cd3d7255a243a1a5bf56e202053100"
+  },
+  "v3": {
+    "commit": "366ded8",
+    "sha256": "72b171fab7c0adbdae617667f326c62cc97e05dfabdd9a374b70ebb0fa8593c3"
+  },
+  "v4": {
+    "commit": "faeb62c",
+    "sha256": "a035ecd3dfccfdf5b937aaa7357867a0c50ee60f87d8e86c4812622835f370d1"
+  },
+  "v5": {
+    "commit": "89c0979",
+    "sha256": "d24a5199c5c6c42b235a22c173683430c16597c976b80c7dc18e3a52639dae50"
+  },
+  "v6": {
+    "commit": null,
+    "sha256": "dce671bd4082bed0e9e19d7fcc207bf3f9530f0c51bae77277f4345db83eabaa"
+  }
+}

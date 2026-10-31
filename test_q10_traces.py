@@ -48,6 +48,8 @@ class TraceTests(unittest.IsolatedAsyncioTestCase):
         await self.client.aclose()
         if self.q._conn is not None:
             self.q._conn.close()
+        if hasattr(self, "suite"):
+            self.suite.close()
         self.folder.cleanup()
 
     def batch(self, message_id="msg-start", packages=None):
@@ -203,9 +205,10 @@ class TraceTests(unittest.IsolatedAsyncioTestCase):
         for name in ("q8", "q9", "q11"):
             unrelated[name] = types.ModuleType(name)
             unrelated[name].router = APIRouter()
-        with patch.dict(sys.modules, {**unrelated, "q10": self.q}):
+        with patch.dict(sys.modules, {**unrelated, "q10": self.q, "q10_variants": module("q10_variants")}):
             main = module("main")
         main._DEBUG_KEY = self.q._Q10_WIRE_KEY
+        self.suite = main.Q2_SUITE
         async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://test") as client:
             sent = await client.post("/message:send", headers=self.headers, json=self.batch())
             self.assertEqual(sent.status_code, 200, sent.text)
@@ -217,7 +220,7 @@ class TraceTests(unittest.IsolatedAsyncioTestCase):
             public = await client.get("/debug/logs/q10")
             self.assertNotIn(self.q._Q10_WIRE_KEY, public.text)
             self.assertNotIn("test-owner-credential", public.text)
-            self.assertEqual((await client.get("/health")).json()["version"], self.q.SOLVER_VERSION)
+            self.assertEqual((await client.get("/health")).json()["version"], "offline-v36-d")
             for index in range(5):
                 main.LOGS_Q11.append({"timestamp": float(index + 1), "method": "POST",
                     "url": "http://test/v2/incidents", "headers": {"x-debug-key": "q11-secret"},

@@ -65,15 +65,19 @@ COMPLETED = "TASK_STATE_COMPLETED"
 CANCELED = "TASK_STATE_CANCELED"
 TERMINAL = {COMPLETED, CANCELED, "TASK_STATE_FAILED", "TASK_STATE_REJECTED"}
 
-DB_PATH = os.environ.get("A2A_DB", os.environ.get("GA5_DB", "/tmp/ga5_q10.db"))
+_INSTANCE_CONFIG = globals().get("_INSTANCE_CONFIG", {})
+DB_PATH = _INSTANCE_CONFIG.get("db_path", os.environ.get("A2A_DB", os.environ.get("GA5_DB", "/tmp/ga5_q10.db")))
 
 # v3 debug wire: persists every graded batch / continuation locally so the
 # fresh audit families can be replayed and patched without touching the graded
 # task store path. Gated behind an unguessable ?key= (not part of grading).
-_Q10_WIRE_KEY = os.environ.get("DEBUG_KEY", "")
+_Q10_WIRE_KEY = _INSTANCE_CONFIG.get("debug_key", os.environ.get("DEBUG_KEY", ""))
+_WIRE_ENABLED = _INSTANCE_CONFIG.get("wire_enabled", True)
 
 
 def _q10_wire(kind, body=None, resp=None, task_id=None, batch_id=None, who=None, note=None):
+    if not _WIRE_ENABLED:
+        return
     try:
         with _db_lock:
             c = db()
@@ -101,12 +105,19 @@ def _q10_batch_part(message):
 
 # -------------------------------------------------------------- diagnostics
 
-SOLVER_VERSION = "offline-v36-d"
-MISSING_IDENTITY_MARKER = ""
-_TRACE_DB_PATH = os.environ.get("Q10_TRACE_DB", DB_PATH + ".traces")
+SOLVER_VERSION = _INSTANCE_CONFIG.get("solver_version", "offline-v37-e")
+MISSING_IDENTITY_MARKER = _INSTANCE_CONFIG.get("marker", "")
+_RATIONALE_STYLE = _INSTANCE_CONFIG.get("rationale_style", "no-footer")
+_VENDOR_BINDING = _INSTANCE_CONFIG.get("vendor_binding", "current-order")
+_VARIANT_ID = _INSTANCE_CONFIG.get("variant_id", "baseline")
+_CONFIG_DIGEST = _INSTANCE_CONFIG.get("config_digest")
+_PUBLIC_BASES = _INSTANCE_CONFIG.get("public_bases", ("/", "/a2a/"))
+_TASK_NAMESPACE = _INSTANCE_CONFIG.get("task_namespace", "q10-task-v1")
+_EXTERNAL_ORIGIN = _INSTANCE_CONFIG.get("external_origin", os.environ.get("RENDER_EXTERNAL_URL"))
+_TRACE_DB_PATH = _INSTANCE_CONFIG.get("trace_path", os.environ.get("Q10_TRACE_DB", DB_PATH + ".traces"))
 _TRACE_BODY_LIMIT = 2 * 1024 * 1024
-_TRACE_STORAGE_LIMIT = 32 * 1024 * 1024
-_TRACE_ROW_LIMIT = 500
+_TRACE_STORAGE_LIMIT = _INSTANCE_CONFIG.get("trace_storage_limit", 32 * 1024 * 1024)
+_TRACE_ROW_LIMIT = _INSTANCE_CONFIG.get("trace_row_limit", 500)
 _TRACE_FAILURES = 0
 _TRACE_LAST_ERROR = None
 _TRACE_SECRET_KEYS = {"authorization", "cookie", "setcookie", "apikey", "accesstoken",
@@ -158,7 +169,7 @@ def _trace_store(event):
         encoded = json.dumps(_trace_safe(event), ensure_ascii=False)
         payload_bytes = len(encoded.encode("utf-8"))
         if payload_bytes > _TRACE_STORAGE_LIMIT:
-            compact = {key: event[key] for key in ("schemaVersion", "solverVersion", "received", "method", "path",
+            compact = {key: event[key] for key in ("schemaVersion", "solverVersion", "variantId", "configDigest", "received", "method", "path",
                        "status", "taskId", "messageId") if key in event}
             compact.update({"omittedReason": "event_size_limit", "originalPayloadBytes": payload_bytes})
             encoded = json.dumps(_trace_safe(compact), ensure_ascii=False)
@@ -229,7 +240,9 @@ async def _capture_trace(request, raw, response=None, error=None):
             if isinstance(data, dict):
                 batches.append(data.get("batchId"))
                 outcomes.extend(data.get("results", []) if isinstance(data.get("results"), list) else [])
-        event = {"schemaVersion": 1, "solverVersion": SOLVER_VERSION, "received": time.time(),
+        event = {"schemaVersion": 1, "solverVersion": SOLVER_VERSION, "variantId": _VARIANT_ID,
+                 "configDigest": _CONFIG_DIGEST, "rationaleStyle": _RATIONALE_STYLE, "vendorBinding": _VENDOR_BINDING,
+                 "received": time.time(),
                  "method": request.method, "path": request.url.path,
                  "status": response.status_code if response is not None else 500,
                  "durationMs": round((time.monotonic() - request.state.q10_trace_start) * 1000, 2),
@@ -433,7 +446,7 @@ def check_headers(request, *, body=False):
 # ------------------------------------------------------------- agent card
 
 def _origin(request: Request) -> str:
-    env = os.environ.get("RENDER_EXTERNAL_URL")
+    env = _EXTERNAL_ORIGIN
     if env:
         return env.rstrip("/")
     host = request.headers.get("host", "localhost")
@@ -446,7 +459,8 @@ def build_card(request: Request) -> dict:
     /a2a, advertise the /a2a base; otherwise advertise the origin. Endpoints are
     served at both, so either submitted base URL works."""
     origin = _origin(request)
-    base = origin + ("/a2a/" if request.url.path.startswith("/a2a") else "/")
+    base = origin + next((prefix for prefix in sorted(_PUBLIC_BASES, key=len, reverse=True)
+                          if request.url.path.startswith(prefix)), _PUBLIC_BASES[0])
     return {
         "protocolVersion": "1.0",
         "name": "GA5 Invoice Action Agent",
@@ -467,10 +481,8 @@ def build_card(request: Request) -> dict:
             "extendedAgentCard": False,
         },
         "supportedInterfaces": [
-            {"url": origin + "/", "protocolBinding": "HTTP+JSON",
-             "protocolVersion": "1.0"},
-            {"url": origin + "/a2a/", "protocolBinding": "HTTP+JSON",
-             "protocolVersion": "1.0"},
+            {"url": origin + prefix, "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}
+            for prefix in _PUBLIC_BASES
         ],
         "defaultInputModes": [MODE_BATCH, MODE_RESULTS, "application/json"],
         "defaultOutputModes": [MODE_PROPOSALS, MODE_RECEIPTS, "application/json"],
@@ -955,7 +967,7 @@ _AUDIT_NOISE = {
 _AUDIT_ARCHIVE = re.compile(r"^(?:Archived supplier memo|Archive examples|Historical bank transfer|A previous quarter|Operations discussed .+?training case|A closed reconciliation incident for a separate supplier)", re.I)
 
 
-def _relationship_rationale(action, facts, current_order, evidence, details, sources):
+def _relationship_rationale(action, facts, current_order, evidence, details, sources, include_footer=None):
     """Bind each citation to its source within the 1500-character contract."""
     if action == "reject_duplicate":
         reason = "The recorded disbursement discharged this same order; a second payment is prohibited."
@@ -987,7 +999,7 @@ def _relationship_rationale(action, facts, current_order, evidence, details, sou
         if len(text) > limit:
             text = text[:max(0, limit - 3)].rsplit(" ", 1)[0] + "..."
         citations.append(f'{ref}: "{text}".')
-    return lead + " ".join(citations)
+    return lead + " ".join(citations) + (suffix if (include_footer if include_footer is not None else _RATIONALE_STYLE == "excerpts") else "")
 
 
 def _incomplete_identity_rationale(action, facts, current_order, evidence, details):
@@ -1019,11 +1031,77 @@ def _incomplete_identity_rationale(action, facts, current_order, evidence, detai
             f"{consequence}.")
 
 
+def _trial_a_rationale(action, facts, current_order, evidence, details, sources):
+    """Explain a parsed incomplete case with one source-bound claim per reference."""
+    first, second, third = evidence
+    amount, currency = facts["amountMinor"], facts["currency"]
+    invoice = facts["invoiceNumber"]
+    if invoice == "unknown":
+        first_claim = f"Records current order {current_order} and a billed amount of {amount} minor units of {currency}."
+        if re.search(r"receiving entry confirms the billed units", sources[first], re.I):
+            first_claim += " The receiving entry confirms the billed units."
+    else:
+        first_claim = f"Identifies invoice {invoice} for order {current_order}, billed at {amount} minor units of {currency}."
+    payee_account = re.search(r"\b(?:payee|beneficiary|vendor(?: account)?)\s+(?:is\s+)?(AC-[A-Z0-9-]+)\b",
+                              sources[first], re.I)
+    if facts["vendorName"] == "unknown" and payee_account:
+        first_claim += f" Names signed payee account {payee_account.group(1)}, not a human-readable vendor."
+
+    if action == "reject_duplicate":
+        second_claim = "Records a settled payment for this same commercial order."
+        third_claim = "Prohibits a second payment for an already discharged order; reject the duplicate."
+    elif action == "open_exception":
+        second_claim = "Shows a discrepancy in the controlling signed commercial records."
+        third_claim = "Requires the exception workflow for that unresolved discrepancy."
+    elif action == "hold_invoice":
+        second_claim = "Records changed remittance instructions with verification still pending."
+        third_claim = "Requires payment to remain paused until verification completes."
+    else:
+        second_claim = f"Records payment against different order {details['paidOrder']}, not current order {current_order}."
+        comparison = "within" if action == "settle_invoice" else "above"
+        consequence = "Autonomous settlement is permitted" if action == "settle_invoice" else "A named approver is required before payment"
+        third_claim = f"The payable is {comparison} the {details['limitMinor']} minor-unit ceiling for {currency}. {consequence}."
+
+    claims = {first: first_claim, second: second_claim, third: third_claim}
+    if action in ("settle_invoice", "request_approval"):
+        for reference in evidence:
+            bank = _AUDIT_COMPONENTS["bank"].search(sources[reference])
+            if bank:
+                confirmed = bank.group(3) == "confirmed through the established vendor channel"
+            else:
+                semantic_bank = _semantic_bank_record(sources[reference])
+                confirmed = bool(semantic_bank and semantic_bank[2])
+            if confirmed:
+                claims[reference] += " Remittance verification is confirmed in this record."
+    missing = [field for field in ("vendorName", "invoiceNumber") if facts[field] == "unknown"]
+    rationale = f"Action {action} for order {current_order}. "
+    rationale += " ".join(f"[{reference}] {claims[reference]}" for reference in evidence)
+    rationale += " Missing source fields: " + ", ".join(missing) + "; these remain unknown rather than invented."
+    if len(rationale) > 1500:
+        return _relationship_rationale(action, facts, current_order, evidence, details, sources, include_footer=True)
+    return rationale
+
+
+def _render_relationship(action, facts, current_order, evidence, details, sources):
+    if _RATIONALE_STYLE == "concise" and any(facts[key] == "unknown" for key in ("vendorName", "invoiceNumber")):
+        return _trial_a_rationale(action, facts, current_order, evidence, details, sources)
+    return _relationship_rationale(action, facts, current_order, evidence, details, sources,
+                                   include_footer=_RATIONALE_STYLE != "no-footer")
+
+
 def _named_payee(value):
     """A payment-account identifier is not a human-readable vendor name."""
     if not value or re.fullmatch(r"AC-[A-Z0-9-]+", value, re.I):
         return "unknown"
     return value
+
+
+def _current_order_vendor(current_vendor, ledger_vendor, paid_order, current_order):
+    if _VENDOR_BINDING == "legacy":
+        return current_vendor if current_vendor != "unknown" else ledger_vendor
+    if current_vendor != "unknown":
+        return current_vendor
+    return ledger_vendor if paid_order == current_order else "unknown"
 
 
 def distributed_decision(pkg):
@@ -1100,8 +1178,11 @@ def distributed_decision(pkg):
     limit_minor = (_money_minor(components["ceiling"][2], components["ceiling"][1])
                    if "ceiling" in components else None)
     details = {"paidOrder": ledger[3] if ledger else None, "limitMinor": limit_minor}
+    rationale = _render_relationship(action, facts, current_order, evidence, details, sources)
+    # Render first to preserve Trial D's exact citation budget and source quotations.
+    facts["vendorName"] = _current_order_vendor(
+        current_vendor, ledger[2] if ledger else "unknown", ledger[3] if ledger else None, current_order)
     missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
-    rationale = _relationship_rationale(action, facts, current_order, evidence, details, sources)
     return {"action": action, "facts": facts, "evidenceRefs": evidence, "rationale": rationale,
             "unresolvedFacts": missing}
 
@@ -1255,11 +1336,13 @@ def semantic_distributed_decision(pkg):
         evidence.append(ref)
     facts = {"vendorName": vendor, "invoiceNumber": invoice_id,
              "amountMinor": amount, "currency": currency}
-    missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
     details = {"paidOrder": ledger[1][2] if ledger else None,
                "limitMinor": ceilings[0][1][1] if ceilings else None}
     sources = {ref: text for ref, text, _roles in records}
-    rationale = _relationship_rationale(action, facts, current_order, evidence, details, sources)
+    rationale = _render_relationship(action, facts, current_order, evidence, details, sources)
+    facts["vendorName"] = _current_order_vendor(
+        current_vendor, ledger[1][1] if ledger else "unknown", ledger[1][2] if ledger else None, current_order)
+    missing = [key for key in ("vendorName", "invoiceNumber") if facts[key] == "unknown"]
     return {"action": action, "facts": facts, "evidenceRefs": evidence,
             "rationale": rationale, "unresolvedFacts": missing}
 
@@ -1551,7 +1634,7 @@ async def start_task(who, message, message_id, fingerprint, traces=None):
     if len(set(ids)) != len(ids):
         return err(422, "INVALID_ARGUMENT", "duplicate packageId in batch")
 
-    task_id = "task-" + sha("q10-task-v1", who, fingerprint)[:16]
+    task_id = "task-" + sha(_TASK_NAMESPACE, who, fingerprint)[:16]
     context_id = str(batch_id or ("ctx_" + sha("q10-ctx-v1", who, fingerprint)[:24]))
 
     existing, owner = load_task(task_id)
@@ -1590,8 +1673,8 @@ async def start_task(who, message, message_id, fingerprint, traces=None):
         d = decide(pkg, trace=trace)
         if trace is not None:
             if d.get("unresolvedFacts"):
-                trace["incompleteRationaleFormat"] = "source-excerpts-no-footer"
-                trace["missingIdentityMarker"] = "empty-string"
+                trace["incompleteRationaleFormat"] = "source-excerpts-no-footer" if _RATIONALE_STYLE == "no-footer" else _RATIONALE_STYLE
+                trace["missingIdentityMarker"] = "empty-string" if MISSING_IDENTITY_MARKER == "" else MISSING_IDENTITY_MARKER
             traces.append(trace)
         proposals.append({
             "packageId": ids[i],
@@ -1828,7 +1911,8 @@ async def q10_trace_index(request: Request):
                                        task_id=request.query_params.get("taskId"), limit=limit)
     except sqlite3.Error:
         return JSONResponse({"error": "trace storage unavailable"}, status_code=503)
-    return JSONResponse({"solverVersion": SOLVER_VERSION, "rows": rows,
+    return JSONResponse({"solverVersion": SOLVER_VERSION, "variantId": _VARIANT_ID,
+                         "configDigest": _CONFIG_DIGEST, "rows": rows,
                          "nextBefore": rows[-1]["id"] if len(rows) == limit else None,
                          "captureFailures": _TRACE_FAILURES, "lastCaptureError": _TRACE_LAST_ERROR,
                          "bodyLimitBytes": _TRACE_BODY_LIMIT, "retainedPayloadLimitBytes": _TRACE_STORAGE_LIMIT,

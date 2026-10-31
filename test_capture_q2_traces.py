@@ -63,6 +63,24 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(manifest["missingRows"], [1])
             self.assertEqual(manifest["files"], [])
 
+    def test_variant_aliases_select_separate_diagnostics(self):
+        for base in ("https://example.test/v18/", "https://example.test/a2a/v18/"):
+            seen = []
+            def respond(request):
+                seen.append(request.url.path)
+                self.assertTrue(request.url.path.startswith("/debug/q10/variants/v18/traces"))
+                if request.url.path.endswith("/traces"):
+                    return httpx.Response(200, json={"variantId": "v18", "configDigest": "fixed", "rows": [{"id": 1}], "nextBefore": None})
+                return httpx.Response(200, json={"variantId": "v18", "configDigest": "fixed", "id": 1})
+            with tempfile.TemporaryDirectory() as parent, httpx.Client(transport=httpx.MockTransport(respond)) as client:
+                _, manifest = capture.export(client, base, Path(parent))
+                self.assertEqual(manifest["variantId"], "v18")
+                self.assertEqual(manifest["configDigest"], "fixed")
+                self.assertEqual(len(seen), 2)
+        for base in ("https://example.test/v19", "https://example.test/v2/incidents", "https://example.test/a2a/v01"):
+            with self.assertRaises(ValueError):
+                capture.diagnostic_base(base)
+
     def test_invalid_origins_are_rejected_before_any_request(self):
         def unexpected(request):
             self.fail("An invalid origin caused a request")

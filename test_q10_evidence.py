@@ -104,7 +104,8 @@ class InvoiceEvidenceTests(unittest.TestCase):
                 package = invoice_package(action)
                 decision = q10.decide(package)
                 self.assertEqual(decision["facts"][field], "")
-                self.assertEqual(decision["unresolvedFacts"], [field])
+                expected_missing = ["vendorName", "invoiceNumber"] if action == "settle_invoice" else [field]
+                self.assertEqual(decision["unresolvedFacts"], expected_missing)
                 self.assertIn(identifier, decision["rationale"])
                 self.assert_citations(package, decision)
 

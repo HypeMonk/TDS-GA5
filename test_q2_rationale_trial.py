@@ -13,17 +13,11 @@ q10 = fixtures.q10
 
 
 def baseline_decision(package):
-    helper = q10._relationship_rationale
-
-    def with_footer(action, facts, current_order, evidence, details, sources):
-        rationale = helper(action, facts, current_order, evidence, details, sources)
-        missing = [field for field in ("vendorName", "invoiceNumber") if facts[field] == "unknown"]
-        if missing:
-            rationale += " Missing source fields: " + ", ".join(missing) + "; unknown is not an inferred identity."
-        return rationale
-
-    with patch.object(q10, "_relationship_rationale", with_footer):
-        return q10.decide(package)
+    decision = q10.decide(package)
+    missing = decision.get("unresolvedFacts", [])
+    if missing:
+        decision["rationale"] += " Missing source fields: " + ", ".join(missing) + "; unknown is not an inferred identity."
+    return decision
 
 
 def complete_package(action, currency="USD"):
